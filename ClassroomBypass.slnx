@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="FocusCheat/FocusCheat.vcxproj" Id="d9bee75f-8dcb-4efb-b512-19f3168d27ce" />
+  <Project Path="Injector/Injector.vcxproj" Id="54bdcba6-7ec6-422e-acd0-0e7e56d6b29e" />
+</Solution>
