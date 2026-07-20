@@ -44,6 +44,20 @@ BOOL WINAPI FakeSetWindowDisplayAffinity(HWND hWnd, DWORD dwAffinity) {
     return TrueSetWindowDisplayAffinity(hWnd, dwAffinity);
 }
 
+// ---------- Uninstall all hooks ----------
+void RemoveHooks() {
+    if (g_hMsgHook) {
+        UnhookWindowsHookEx(g_hMsgHook);
+        g_hMsgHook = NULL;
+    }
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    DetourDetach(&(PVOID&)TrueGetForegroundWindow, FakeGetForegroundWindow);
+    DetourDetach(&(PVOID&)TrueSetWindowDisplayAffinity, FakeSetWindowDisplayAffinity);
+    DetourTransactionCommit();
+}
+
 // ---------- Install all hooks ----------
 BOOL InstallHooks() {
     // 1. Find target window by class name "EXAMPLE_WINDOW_CLASS"

@@ -8,3 +8,4 @@
 #endif
 
 FOCUSCHEAT_API BOOL InstallHooks();
+FOCUSCHEAT_API void RemoveHooks();

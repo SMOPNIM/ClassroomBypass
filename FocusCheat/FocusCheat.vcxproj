@@ -79,13 +79,13 @@
       <LanguageStandard>stdcpp20</LanguageStandard>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>C:\Users\31396\Desktop\Github\Detours\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(DETOURS_ROOT)\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalLibraryDirectories>C:\Users\31396\Desktop\Github\Detours\lib.X86</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(DETOURS_ROOT)\lib.X86</AdditionalLibraryDirectories>
       <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);detours.lib</AdditionalDependencies>
     </Link>
     <Manifest>
@@ -103,13 +103,13 @@
       <LanguageStandard>stdcpp20</LanguageStandard>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>C:\Users\31396\Desktop\Github\Detours\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(DETOURS_ROOT)\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalLibraryDirectories>C:\Users\31396\Desktop\Github\Detours\lib.X86</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(DETOURS_ROOT)\lib.X86</AdditionalLibraryDirectories>
       <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);detours.lib</AdditionalDependencies>
     </Link>
     <Manifest>

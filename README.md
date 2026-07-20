@@ -50,13 +50,19 @@ nmake -f Makefile
 
 编译后会在上级目录生成 `lib.X86`（32 位）或 `lib.x64`（64 位）文件夹，以及 `include` 文件夹。
 
+设置环境变量 `DETOURS_ROOT` 指向 Detours 根目录（即包含 `include` 和 `lib.X86` 的上级目录），例如：
+```bash
+set DETOURS_ROOT=C:\path\to\Detours
+```
+也可以在系统环境变量中永久设置。
+
 > **注意**：本项目目标进程为 32 位，因此只需编译 **x86** 版本（使用 `Developer Command Prompt for VS` 默认即为 x86 环境）。
 
 ---
 
 ### 2. 打开解决方案
 
-用 Visual Studio 打开 `ClassroomBypass.sln`。
+用 Visual Studio 打开 `ClassroomBypass.slnx`。
 
 ### 3. 配置项目属性（FocusCheat）
 

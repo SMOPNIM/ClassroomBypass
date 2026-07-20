@@ -15,7 +15,7 @@ BOOL APIENTRY DllMain(HMODULE hModule,
         InstallHooks();
         break;
     case DLL_PROCESS_DETACH:
-        // Cleanup is handled in FocusCheat.cpp if needed
+        RemoveHooks();
         break;
     }
     return TRUE;

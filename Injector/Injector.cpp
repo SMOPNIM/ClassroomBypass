@@ -68,7 +68,13 @@ int main() {
         system("pause");
         return 1;
     }
-    WriteProcessMemory(hProcess, pRemoteMem, dllPath.c_str(), pathSize, NULL);
+    if (!WriteProcessMemory(hProcess, pRemoteMem, dllPath.c_str(), pathSize, NULL)) {
+        std::wcout << L"WriteProcessMemory failed. Error code: " << GetLastError() << std::endl;
+        VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        system("pause");
+        return 1;
+    }
 
     // Create a remote thread to load the DLL (LoadLibraryW)
     HMODULE hKernel32 = GetModuleHandle(L"kernel32.dll");
