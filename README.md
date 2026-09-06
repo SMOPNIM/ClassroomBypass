@@ -33,50 +33,57 @@
 ## 🖥️ 系统要求
 
 - Windows 10 / 11（x64 或 x86）
-- Visual Studio 2022（或 2019） 并安装 **“使用 C++ 的桌面开发”** 工作负载
-- Microsoft Detours 库（源码版，需手动编译）
+- Visual Studio 2022（或 Build Tools），安装 **"使用 C++ 的桌面开发"** 工作负载
+- Detours 已作为 git submodule 包含在项目中，无需额外下载或设置环境变量
 
 ---
 
 ## 🔧 编译步骤
 
-### 1. 获取并编译 Detours
+### 1. 克隆项目（含 submodule）
 
 ```bash
-git clone https://github.com/microsoft/Detours.git
-cd Detours/src
-nmake -f Makefile
+git clone --recurse-submodules https://github.com/SMOPNIM/ClassroomBypass.git
+cd ClassroomBypass
 ```
 
-编译后会在上级目录生成 `lib.X86`（32 位）或 `lib.x64`（64 位）文件夹，以及 `include` 文件夹。
+若已克隆但未拉取 submodule：
 
-设置环境变量 `DETOURS_ROOT` 指向 Detours 根目录（即包含 `include` 和 `lib.X86` 的上级目录），例如：
 ```bash
-set DETOURS_ROOT=C:\path\to\Detours
+git submodule update --init
 ```
-也可以在系统环境变量中永久设置。
 
-> **注意**：本项目目标进程为 32 位，因此只需编译 **x86** 版本（使用 `Developer Command Prompt for VS` 默认即为 x86 环境）。
+### 2. 编译 Detours（仅首次）
 
----
+打开 **Developer Command Prompt for VS**（默认即为 x86 环境），执行：
 
-### 2. 打开解决方案
+```cmd
+cd Detours\src
+nmake /nologo
+```
 
-用 Visual Studio 打开 `ClassroomBypass.slnx`。
+编译完成后会在 `Detours\lib.X86\` 生成 `detours.lib`，`Detours\include\` 生成头文件。
 
-### 3. 配置项目属性（FocusCheat）
+### 3. 编译项目
 
-- **平台**：选择 **x86**（必须与目标进程一致）。
-- **C/C++ → 附加包含目录**：添加 `Detours\include` 路径。
-- **链接器 → 附加库目录**：添加 `Detours\lib.X86` 路径。
-- **链接器 → 输入 → 附加依赖项**：追加 `detours.lib`（保留原有默认库）。
-- **C/C++ → 预编译头**：选择 **“不使用预编译头”**（对 `FocusCheat.cpp` 和 `dllmain.cpp` 都做此设置）。
+同一命令行中继续执行：
 
-### 4. 生成解决方案
+```cmd
+cd ..
+msbuild FocusCheat\FocusCheat.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:PlatformToolset=v143 /p:SolutionDir="%CD%\\" /nologo /verbosity:minimal
+msbuild Injector\Injector.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:PlatformToolset=v143 /p:SolutionDir="%CD%\\" /nologo /verbosity:minimal
+```
 
-按 `Ctrl+Shift+B` 编译，成功后会在 `x86\Debug`（或 `Release`）下生成：
-- `FocusCheat.dll`
-- `Injector.exe`
+编译产物在 `Debug\` 目录下：`Injector.exe` 和 `FocusCheat.dll`。
+
+> **注意**：
+> - 必须选择 **x86** 平台（目标进程为 32 位）。
+> - 若使用 VS 2022 完整版，`PlatformToolset` 改为 `v145`。
+> - Release 编译将 `Debug` 替换为 `Release` 即可。
+
+### 也可通过 Visual Studio 编译
+
+用 VS 打开 `ClassroomBypass.slnx`，选择 **x86** 平台，按 `Ctrl+Shift+B` 生成。
 
 ---
 
@@ -112,7 +119,7 @@ set DETOURS_ROOT=C:\path\to\Detours
 - 可能程序使用了更底层的防截屏机制（如 DirectX 层拦截）。本方案已覆盖最常见的 `SetWindowDisplayAffinity`，若无效可尝试其他工具。
 
 ### Q: 注入后系统卡顿或程序崩溃
-- 请确保 Detours 版本与编译器匹配，且项目配置正确。尝试清理解决方案并重新生成。
+- 确保使用 x86 平台编译，且 Detours submodule 已正确初始化（`git submodule update --init`）。尝试清理输出目录并重新编译。
 
 ---
 
