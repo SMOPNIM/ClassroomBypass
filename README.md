@@ -108,6 +108,38 @@ msbuild Injector\Injector.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:Pl
 
 ---
 
+## ⚙️ FocusCheat.ini 配置（可选）
+
+默认只启用通用钩子（前台欺骗、截屏、失焦消息）。如需额外拦截目标进程内某模块的内部通知函数，可通过配置文件启用自定义钩子。
+
+### 1. 放置文件
+
+将 `FocusCheat.example.ini` 复制为 `FocusCheat.ini`，与 `FocusCheat.dll` **放在同一文件夹**。文件不存在则跳过自定义钩子，不影响通用功能。
+
+### 2. 填写内容
+
+```ini
+[CustomHooks]
+Module=example_module.dll
+Signature1=ExampleEventA
+Signature2=ExampleEventB
+```
+
+| 字段 | 说明 |
+|------|------|
+| `Module` | 目标进程中已加载的模块文件名。为空则整个自定义钩子被跳过；若模块尚未加载也会跳过（不报错） |
+| `Signature1` / `Signature2` | 该模块 `.rdata` 中的特征字符串（最多 2 个，建议使用纯 ASCII）。为空的项会被跳过 |
+
+### 3. 工作原理
+
+注入时 DLL 会在目标模块内存中搜索特征字符串，找到引用它的代码位置后回溯到函数起始（`push ebp; mov ebp, esp`），用 Detours 挂上空操作钩子，使该函数直接返回、不再向外发送通知。定位失败（字符串不存在、无引用、找不到函数边界）时静默跳过该项。
+
+### 4. 如何找特征字符串
+
+用 x64dbg / IDA 等工具在目标模块中搜索与待拦截行为相关的字符串（如事件名、日志关键字），通过交叉引用确认引用它的函数即为候选目标。填入前请确认该模块属于你拥有或已获明确授权测试的程序。
+
+---
+
 ## ⚠️ 注意事项
 
 - **杀毒软件拦截**：由于 DLL 注入技术常被恶意软件利用，Windows Defender 等会报毒。请按以下方式解决：
