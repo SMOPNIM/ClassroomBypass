@@ -202,7 +202,7 @@ static void PrintUsage() {
                << L"  --help, -h             Show this help\n"
                << L"\n"
                << L"Interactive picker: type to filter (name or PID), Up/Down = move,\n"
-               << L"  PgUp/PgDn = page, / = clear filter, Enter = confirm, Esc = cancel.\n"
+               << L"  PgUp/PgDn = page, / = clear filter, Enter = confirm, Esc/Ctrl+C = cancel.\n"
                << L"\n"
                << L"Examples:\n"
                << L"  Injector.exe --list\n"
@@ -326,6 +326,18 @@ static std::wstring ProcessNameByPid(const std::vector<ProcessEntry>& all, DWORD
     return L"";
 }
 
+// Set while the picker runs; lets Ctrl+C cancel instead of killing.
+// (Ctrl+Break keeps its default terminate behavior.)
+static volatile BOOL g_pickerCancel = FALSE;
+
+static BOOL WINAPI PickerCtrlHandler(DWORD ctrlType) {
+    if (ctrlType == CTRL_C_EVENT) {
+        g_pickerCancel = TRUE;
+        return TRUE;
+    }
+    return FALSE;
+}
+
 // ============================================================
 // Interactive TUI picker
 // ============================================================
@@ -334,14 +346,27 @@ namespace picker {
 // Frame rendering uses absolute buffer coordinates (see Run below),
 // so it self-heals even if a line wraps or the console resizes.
 
-// Render the picker block; returns the number of printed lines.
-static int Render(const std::vector<ProcessEntry>& rows, const std::vector<size_t>& view,
-                  size_t selected, size_t page, size_t pageSize,
-                  const std::wstring& filter) {
-    int lines = 0;
-    auto emit = [&](const std::wstring& s) {
-        std::wcout << s << L"\n";
-        ++lines;
+// A picker frame: one text + color per line. Blitted to the console in a
+// single WriteConsoleOutputW call, so partial frames can never appear.
+struct FrameLine {
+    std::wstring text;
+    WORD attr;
+};
+
+static std::vector<FrameLine> BuildFrame(const std::vector<ProcessEntry>& rows,
+                                         const std::vector<size_t>& view,
+                                         size_t selected, size_t page, size_t pageSize,
+                                         const std::wstring& filter, WORD defAttr) {
+    const WORD cyan = FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY;
+    const WORD yellow = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY;
+    const WORD dim = FOREGROUND_INTENSITY;
+
+    std::vector<FrameLine> lines;
+    auto emit = [&](const std::wstring& s, WORD attr) {
+        FrameLine ln;
+        ln.text = s;
+        ln.attr = attr;
+        lines.push_back(ln);
     };
 
     size_t totalPages = (view.size() + pageSize - 1) / pageSize;
@@ -352,22 +377,16 @@ static int Render(const std::vector<ProcessEntry>& rows, const std::vector<size_
     swprintf_s(head, L"Select target process  (page %llu/%llu, %llu match%s)",
                (unsigned long long)(page + 1), (unsigned long long)totalPages,
                (unsigned long long)view.size(), view.size() == 1 ? L"" : L"es");
-    ui::SetColor(FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
-    std::wcout << head << L"\n";
-    ui::ResetColor();
-    ++lines;
+    emit(head, cyan);
 
     if (!filter.empty()) {
-        ui::Write(L"Filter: ");
-        ui::Write(filter);
-        ui::Write(L"\n");
-        ++lines;
+        emit(L"Filter: " + filter, defAttr);
     }
 
-    emit(L"  #     PID       Image Name");
-    emit(L"  --    --------  ------------------------------");
+    emit(L"  #     PID       Image Name", defAttr);
+    emit(L"  --    --------  ------------------------------", defAttr);
 
-    size_t nameWidth = 30;
+    const size_t nameWidth = 30;
     for (size_t i = page * pageSize; i < view.size() && i < (page + 1) * pageSize; ++i) {
         const ProcessEntry& e = rows[view[i]];
         wchar_t row[128];
@@ -388,26 +407,62 @@ static int Render(const std::vector<ProcessEntry>& rows, const std::vector<size_
             nm = cut + L"…";
         }
         line += PadRight(nm, (int)nameWidth);
-        if (i == selected) {
-            ui::SetColor(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY); // yellow highlight
-            std::wcout << line << L"\n";
-            ui::ResetColor();
-        }
-        else {
-            std::wcout << line << L"\n";
-        }
-        ++lines;
+        emit(line, (i == selected) ? yellow : defAttr);
     }
 
-    std::wstring status =
-        L"Type to filter  Up/Down move  PgUp/PgDn page  / clear  Enter OK  Esc cancel";
-    ui::SetColor(FOREGROUND_INTENSITY);
-    std::wcout << status << L"\n";
-    ui::ResetColor();
-    ++lines;
-
-    std::wcout.flush();
+    emit(L"Type=filter Up/Down=move PgUp/PgDn=page Enter=OK Esc=cancel", dim);
     return lines;
+}
+
+// Writes the frame at absolute buffer position (0, topRow) in one call,
+// padding with blank lines up to prevRows so shrunken views leave nothing.
+// Returns rows now occupied, or -1 when the console API is unusable.
+static int BlitFrame(const std::vector<FrameLine>& in, HANDLE hCon, WORD defAttr,
+                     SHORT topRow, int prevRows) {
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (topRow < 0 || !GetConsoleScreenBufferInfo(hCon, &info)) return -1;
+    int width = (int)info.dwSize.X;
+    int bufH = (int)info.dwSize.Y;
+    if (width <= 0 || width > 4096 || bufH <= 0) return -1;
+
+    int frameH = (int)in.size();
+    int totalH = frameH > prevRows ? frameH : prevRows;
+    if (topRow + totalH > bufH) totalH = bufH - (int)topRow;
+    if (totalH <= 0) return -1;
+
+    std::vector<CHAR_INFO> cells((size_t)width * (size_t)totalH);
+    for (size_t k = 0; k < cells.size(); ++k) {
+        cells[k].Char.UnicodeChar = L' ';
+        cells[k].Attributes = defAttr;
+    }
+    for (int r = 0; r < frameH && r < totalH; ++r) {
+        int col = 0;
+        for (wchar_t c : in[r].text) {
+            int cw = CellWidth(c);
+            if (col + cw > width) break;
+            size_t idx = (size_t)r * (size_t)width + (size_t)col;
+            cells[idx].Char.UnicodeChar = c;
+            cells[idx].Attributes = in[r].attr;
+            if (cw == 2 && col + 1 < width) {
+                cells[idx + 1].Attributes = in[r].attr;
+            }
+            col += cw;
+        }
+    }
+
+    COORD bufSize;
+    bufSize.X = (SHORT)width;
+    bufSize.Y = (SHORT)totalH;
+    COORD bufPos;
+    bufPos.X = 0;
+    bufPos.Y = 0;
+    SMALL_RECT dst;
+    dst.Left = 0;
+    dst.Top = topRow;
+    dst.Right = (SHORT)(width - 1);
+    dst.Bottom = (SHORT)((int)topRow + totalH - 1);
+    if (!WriteConsoleOutputW(hCon, cells.data(), bufSize, bufPos, &dst)) return -1;
+    return totalH;
 }
 
 // Filter rows by case-insensitive name substring or PID substring.
@@ -470,10 +525,9 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
     std::wstring filter = initialFilter;
     std::vector<size_t> view = ApplyFilter(rows, filter);
     size_t selected = 0;
-    size_t page = 0;
-    int prevRows = 0;   // measured console rows used by the previous frame
-    SHORT topRow = -1;  // buffer row where the frame starts (-1 = not anchored yet)
-    bool needRender = true;
+    DWORD finalPid = 0;
+    bool needRender = false;
+    bool paintPending = false;
 
     // Hide the blinking cursor for the whole picker session; it is
     // restored on every exit path by the guard's destructor.
@@ -482,54 +536,113 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
         ~CursorGuard() { ui::ShowCursor(); }
     } cursorGuard;
 
-    for (;;) {
-        if (needRender) {
-            size_t totalPages = (view.size() + (size_t)pageSize - 1) / (size_t)pageSize;
-            if (totalPages == 0) totalPages = 1;
-            if (selected >= view.size()) selected = view.empty() ? 0 : view.size() - 1;
-            page = view.empty() ? 0 : selected / (size_t)pageSize;
+    // Swallow Ctrl+C during the picker so it cancels instead of killing.
+    // (Ctrl+Break keeps its default terminate behavior.)
+    struct CtrlGuard {
+        CtrlGuard() {
+            g_pickerCancel = FALSE;
+            SetConsoleCtrlHandler(PickerCtrlHandler, TRUE);
+        }
+        ~CtrlGuard() { SetConsoleCtrlHandler(PickerCtrlHandler, FALSE); }
+    } ctrlGuard;
 
-            // Jump back to the anchored frame top and wipe the previous
-            // frame. Rows are measured, not counted, so wrapped lines or a
-            // resized console cannot desync the layout.
-            HANDLE hCon = GetStdHandle(STD_OUTPUT_HANDLE);
-            CONSOLE_SCREEN_BUFFER_INFO info;
-            bool ok = GetConsoleScreenBufferInfo(hCon, &info) != FALSE;
-            if (ok && topRow < 0) {
-                topRow = info.dwCursorPosition.Y; // anchor on first frame
+    // Drop stale queued input (pastes, held keys) so the session starts clean.
+    while (_kbhit()) _getch();
+
+    HANDLE hCon = GetStdHandle(STD_OUTPUT_HANDLE);
+    WORD defAttr = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE;
+    SHORT topRow = -1;
+    {
+        CONSOLE_SCREEN_BUFFER_INFO abi;
+        if (GetConsoleScreenBufferInfo(hCon, &abi)) {
+            defAttr = abi.wAttributes;
+            topRow = abi.dwCursorPosition.Y;
+        }
+    }
+    int prevRows = 0;
+
+    // Park the cursor below the frame and report the outcome. Runs on every
+    // exit path via the destructor.
+    struct ExitEcho {
+        HANDLE hCon;
+        SHORT& topRow;
+        int& prevRows;
+        const std::vector<ProcessEntry>& rows;
+        DWORD& finalPid;
+        ~ExitEcho() {
+            CONSOLE_SCREEN_BUFFER_INFO ebi;
+            if (GetConsoleScreenBufferInfo(hCon, &ebi)) {
+                int endY = (topRow >= 0 ? (int)topRow + prevRows : (int)ebi.dwCursorPosition.Y);
+                if (endY >= (int)ebi.dwSize.Y) endY = (int)ebi.dwSize.Y - 1;
+                if (endY < 0) endY = 0;
+                COORD p;
+                p.X = 0;
+                p.Y = (SHORT)endY;
+                SetConsoleCursorPosition(hCon, p);
             }
-            if (ok && topRow >= 0) {
-                COORD top{0, topRow};
-                SetConsoleCursorPosition(hCon, top);
-                DWORD written = 0;
-                COORD pos = top;
-                for (int i = 0; i < prevRows; ++i) {
-                    FillConsoleOutputCharacterW(hCon, L' ', (DWORD)info.dwSize.X, pos, &written);
-                    FillConsoleOutputAttribute(hCon, info.wAttributes, (DWORD)info.dwSize.X, pos, &written);
-                    pos.Y++;
-                }
-                SetConsoleCursorPosition(hCon, top);
-            }
-            Render(rows, view, selected, page, (size_t)pageSize, filter);
-            if (GetConsoleScreenBufferInfo(hCon, &info)) {
-                int used = (int)info.dwCursorPosition.Y - (int)topRow;
-                if (used < 0 || topRow < 0) {
-                    // Buffer scrolled or API failed: re-anchor below.
-                    topRow = info.dwCursorPosition.Y;
-                    prevRows = 0;
-                }
-                else {
-                    prevRows = used;
-                }
+            if (finalPid != 0) {
+                wchar_t buf[160];
+                swprintf_s(buf, L"Selected: %lu  %s", (unsigned long)finalPid,
+                           ProcessNameByPid(rows, finalPid).c_str());
+                ui::Success(buf);
             }
             else {
-                topRow = -1;
-                prevRows = 0;
+                ui::Warn(L"Cancelled.");
             }
-            needRender = false;
+        }
+    } exitEcho{GetStdHandle(STD_OUTPUT_HANDLE), topRow, prevRows, rows, finalPid};
+
+    // Paint one atomic frame; falls back to scrolling print if the console
+    // API is unusable (and re-anchors afterwards).
+    auto paintOnce = [&]() {
+        size_t totalPages = (view.size() + (size_t)pageSize - 1) / (size_t)pageSize;
+        if (totalPages == 0) totalPages = 1;
+        if (selected >= view.size()) selected = view.empty() ? 0 : view.size() - 1;
+        size_t page = view.empty() ? 0 : selected / (size_t)pageSize;
+        if (page >= totalPages) page = totalPages - 1;
+        std::vector<FrameLine> frame =
+            BuildFrame(rows, view, selected, page, (size_t)pageSize, filter, defAttr);
+        int used = BlitFrame(frame, hCon, defAttr, topRow, prevRows);
+        if (used < 0) {
+            for (const auto& ln : frame) {
+                ui::SetColor(ln.attr);
+                std::wcout << ln.text << L"\n";
+                ui::ResetColor();
+            }
+            CONSOLE_SCREEN_BUFFER_INFO rbi;
+            if (GetConsoleScreenBufferInfo(hCon, &rbi)) topRow = rbi.dwCursorPosition.Y;
+            else topRow = -1;
+            prevRows = 0;
+        }
+        else {
+            prevRows = used;
+        }
+    };
+
+    paintOnce();
+    ULONGLONG lastPaint = GetTickCount64();
+    for (;;) {
+        if (g_pickerCancel) { finalPid = 0; break; } // Ctrl+C requested cancel
+        if (needRender || paintPending) {
+            // Coalesce bursts: while input is queued and we painted recently,
+            // skip this frame; it will be painted once the queue drains.
+            if (paintPending || (_kbhit() && GetTickCount64() - lastPaint < 50)) {
+                paintPending = true;
+                needRender = false;
+            }
+            else {
+                paintOnce();
+                lastPaint = GetTickCount64();
+                needRender = false;
+                paintPending = false;
+            }
         }
 
         int ch = _getch();
+        if (ch == 3) { // Ctrl+C delivered as a key: cancel
+            finalPid = 0;
+            break;
+        }
         if (ch == 27) { // Esc: clear search first, cancel second
             if (!filter.empty()) {
                 filter.clear();
@@ -538,11 +651,14 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
                 needRender = true;
                 continue;
             }
-            std::wcout << L"\n";
-            return 0;
+            finalPid = 0;
+            break;
         }
         if (ch == 13) { // Enter: confirm highlight (noop on empty view)
-            if (!view.empty()) return rows[view[selected]].pid;
+            if (!view.empty()) {
+                finalPid = rows[view[selected]].pid;
+                break;
+            }
             continue;
         }
         if (ch == 0 || ch == 224) { // extended key
@@ -598,6 +714,7 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
         }
         // Ignore other keys (no redraw).
     }
+    return finalPid;
 }
 
 } // namespace picker

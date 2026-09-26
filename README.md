@@ -95,7 +95,7 @@ msbuild Injector\Injector.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:Pl
 1. 将 `FocusCheat.dll` 和 `Injector.exe` **放在同一个文件夹**中。
 2. 启动你的测试目标程序。
 3. **右键** `Injector.exe` → **“以管理员身份运行”**。
-4. 选择目标：直接运行时会打开交互式进程选择器（直接敲字按进程名/PID 过滤、方向键移动、回车确认、ESC 取消），或用参数直接指定：
+4. 选择目标：直接运行时会打开交互式进程选择器（直接敲字过滤、方向键移动、回车确认、ESC/Ctrl+C 取消），或用参数直接指定：
    ```cmd
    Injector.exe --list
    Injector.exe --pid 1234 --yes
