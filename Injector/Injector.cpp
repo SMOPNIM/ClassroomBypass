@@ -201,8 +201,8 @@ static void PrintUsage() {
                << L"  --page-size <N>        Rows per page in the picker (default: 20)\n"
                << L"  --help, -h             Show this help\n"
                << L"\n"
-               << L"Interactive picker keys: Up/Down = move, PgUp/PgDn = page,\n"
-               << L"  digits = jump to row, / = filter, Enter = confirm, Esc = cancel.\n"
+               << L"Interactive picker: type to filter (name or PID), Up/Down = move,\n"
+               << L"  PgUp/PgDn = page, / = clear filter, Enter = confirm, Esc = cancel.\n"
                << L"\n"
                << L"Examples:\n"
                << L"  Injector.exe --list\n"
@@ -345,7 +345,7 @@ static void MoveCursorUp(int lines) {
 // Render the picker block; returns the number of printed lines.
 static int Render(const std::vector<ProcessEntry>& rows, const std::vector<size_t>& view,
                   size_t selected, size_t page, size_t pageSize,
-                  const std::wstring& filter, const std::wstring& numBuf) {
+                  const std::wstring& filter) {
     int lines = 0;
     auto emit = [&](const std::wstring& s) {
         std::wcout << s << L"\n";
@@ -407,8 +407,8 @@ static int Render(const std::vector<ProcessEntry>& rows, const std::vector<size_
         ++lines;
     }
 
-    std::wstring status = L"Up/Down move  PgUp/PgDn page  digits jump  / filter  Enter OK  Esc cancel";
-    if (!numBuf.empty()) status = L"Row: " + numBuf + L"  (Enter to jump)";
+    std::wstring status =
+        L"Type to filter  Up/Down move  PgUp/PgDn page  / clear  Enter OK  Esc cancel";
     ui::SetColor(FOREGROUND_INTENSITY);
     std::wcout << status << L"\n";
     ui::ResetColor();
@@ -418,13 +418,23 @@ static int Render(const std::vector<ProcessEntry>& rows, const std::vector<size_
     return lines;
 }
 
-// Filter rows by case-insensitive substring; returns indices into rows.
+// Filter rows by case-insensitive name substring or PID substring.
 static std::vector<size_t> ApplyFilter(const std::vector<ProcessEntry>& rows,
                                        const std::wstring& filter) {
     std::vector<size_t> view;
     std::wstring f = ToLower(filter);
     for (size_t i = 0; i < rows.size(); ++i) {
-        if (f.empty() || ToLower(rows[i].name).find(f) != std::wstring::npos) {
+        if (f.empty()) {
+            view.push_back(i);
+            continue;
+        }
+        if (ToLower(rows[i].name).find(f) != std::wstring::npos) {
+            view.push_back(i);
+            continue;
+        }
+        wchar_t pidBuf[32];
+        swprintf_s(pidBuf, L"%lu", (unsigned long)rows[i].pid);
+        if (std::wstring(pidBuf).find(f) != std::wstring::npos) {
             view.push_back(i);
         }
     }
@@ -469,7 +479,6 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
     std::vector<size_t> view = ApplyFilter(rows, filter);
     size_t selected = 0;
     size_t page = 0;
-    std::wstring numBuf;
     int prevLines = 0;
     bool first = true;
     bool needRender = true;
@@ -490,36 +499,29 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
 
             if (!first) MoveCursorUp(prevLines);
             first = false;
-            prevLines = Render(rows, view, selected, page, (size_t)pageSize, filter, numBuf);
+            prevLines = Render(rows, view, selected, page, (size_t)pageSize, filter);
             needRender = false;
         }
 
         int ch = _getch();
-        if (ch == 27) { // Esc
-            if (!numBuf.empty()) {
-                numBuf.clear();
+        if (ch == 27) { // Esc: clear search first, cancel second
+            if (!filter.empty()) {
+                filter.clear();
+                view = ApplyFilter(rows, filter);
+                selected = 0;
                 needRender = true;
                 continue;
             }
             std::wcout << L"\n";
             return 0;
         }
-        if (ch == 13) { // Enter
-            if (!numBuf.empty()) {
-                unsigned long n = std::wcstoul(numBuf.c_str(), nullptr, 10);
-                numBuf.clear();
-                if (n >= 1 && n <= rows.size()) return rows[n - 1].pid;
-                needRender = true;
-                continue;
-            }
+        if (ch == 13) { // Enter: confirm highlight (noop on empty view)
             if (!view.empty()) return rows[view[selected]].pid;
-            return 0;
+            continue;
         }
         if (ch == 0 || ch == 224) { // extended key
             int code = _getch();
             size_t old = selected;
-            bool bufWas = !numBuf.empty();
-            numBuf.clear();
             if (code == 72) { // Up
                 if (selected > 0) --selected;
             }
@@ -540,32 +542,31 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
             else if (code == 79) { // End
                 selected = view.empty() ? 0 : view.size() - 1;
             }
-            if (selected != old || bufWas) needRender = true;
+            if (selected != old) needRender = true;
             continue;
         }
-        if (ch == 8) { // Backspace
-            if (!numBuf.empty()) {
-                numBuf.pop_back();
+        if (ch == 8) { // Backspace: shrink search
+            if (!filter.empty()) {
+                filter.pop_back();
+                view = ApplyFilter(rows, filter);
+                selected = 0;
                 needRender = true;
             }
             continue;
         }
-        if (ch == '/') {
-            numBuf.clear();
-            ui::ShowCursor(); // line input needs a visible cursor
-            ui::Write(L"\nFilter (empty clears): ");
-            std::wstring f;
-            std::getline(std::wcin, f);
-            ui::HideCursor();
-            filter = Trim(f);
-            view = ApplyFilter(rows, filter);
-            selected = 0;
-            first = true; // filter prompt broke cursor tracking; reprint fresh
-            needRender = true;
+        if (ch == '/') { // Clear search
+            if (!filter.empty()) {
+                filter.clear();
+                view = ApplyFilter(rows, filter);
+                selected = 0;
+                needRender = true;
+            }
             continue;
         }
-        if (ch >= '0' && ch <= '9') {
-            numBuf += (wchar_t)ch;
+        if (ch >= 32 && ch <= 126) { // Printable ASCII: live filter
+            filter += (wchar_t)ch;
+            view = ApplyFilter(rows, filter);
+            selected = 0;
             needRender = true;
             continue;
         }
