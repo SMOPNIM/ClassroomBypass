@@ -331,36 +331,8 @@ static std::wstring ProcessNameByPid(const std::vector<ProcessEntry>& all, DWORD
 // ============================================================
 namespace picker {
 
-static void MoveCursorUp(int lines) {
-    if (lines <= 0) return;
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-    CONSOLE_SCREEN_BUFFER_INFO info;
-    if (!GetConsoleScreenBufferInfo(h, &info)) return;
-    COORD pos = info.dwCursorPosition;
-    pos.Y = (SHORT)(pos.Y > lines ? pos.Y - lines : 0);
-    pos.X = 0;
-    SetConsoleCursorPosition(h, pos);
-}
-
-// Erase `lines` console rows starting at the current cursor row.
-// The cursor ends up back at the start row.
-static void ClearRows(int lines) {
-    if (lines <= 0) return;
-    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
-    CONSOLE_SCREEN_BUFFER_INFO info;
-    if (!GetConsoleScreenBufferInfo(h, &info)) return;
-    COORD top = info.dwCursorPosition;
-    top.X = 0;
-    DWORD width = (DWORD)info.dwSize.X;
-    DWORD written = 0;
-    COORD pos = top;
-    for (int i = 0; i < lines; ++i) {
-        FillConsoleOutputCharacterW(h, L' ', width, pos, &written);
-        FillConsoleOutputAttribute(h, info.wAttributes, width, pos, &written);
-        pos.Y++;
-    }
-    SetConsoleCursorPosition(h, top);
-}
+// Frame rendering uses absolute buffer coordinates (see Run below),
+// so it self-heals even if a line wraps or the console resizes.
 
 // Render the picker block; returns the number of printed lines.
 static int Render(const std::vector<ProcessEntry>& rows, const std::vector<size_t>& view,
@@ -499,8 +471,8 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
     std::vector<size_t> view = ApplyFilter(rows, filter);
     size_t selected = 0;
     size_t page = 0;
-    int prevLines = 0;
-    bool first = true;
+    int prevRows = 0;   // measured console rows used by the previous frame
+    SHORT topRow = -1;  // buffer row where the frame starts (-1 = not anchored yet)
     bool needRender = true;
 
     // Hide the blinking cursor for the whole picker session; it is
@@ -517,12 +489,43 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
             if (selected >= view.size()) selected = view.empty() ? 0 : view.size() - 1;
             page = view.empty() ? 0 : selected / (size_t)pageSize;
 
-            if (!first) {
-                MoveCursorUp(prevLines);
-                ClearRows(prevLines); // wipe the old frame so shrinking views leave no stale rows
+            // Jump back to the anchored frame top and wipe the previous
+            // frame. Rows are measured, not counted, so wrapped lines or a
+            // resized console cannot desync the layout.
+            HANDLE hCon = GetStdHandle(STD_OUTPUT_HANDLE);
+            CONSOLE_SCREEN_BUFFER_INFO info;
+            bool ok = GetConsoleScreenBufferInfo(hCon, &info) != FALSE;
+            if (ok && topRow < 0) {
+                topRow = info.dwCursorPosition.Y; // anchor on first frame
             }
-            first = false;
-            prevLines = Render(rows, view, selected, page, (size_t)pageSize, filter);
+            if (ok && topRow >= 0) {
+                COORD top{0, topRow};
+                SetConsoleCursorPosition(hCon, top);
+                DWORD written = 0;
+                COORD pos = top;
+                for (int i = 0; i < prevRows; ++i) {
+                    FillConsoleOutputCharacterW(hCon, L' ', (DWORD)info.dwSize.X, pos, &written);
+                    FillConsoleOutputAttribute(hCon, info.wAttributes, (DWORD)info.dwSize.X, pos, &written);
+                    pos.Y++;
+                }
+                SetConsoleCursorPosition(hCon, top);
+            }
+            Render(rows, view, selected, page, (size_t)pageSize, filter);
+            if (GetConsoleScreenBufferInfo(hCon, &info)) {
+                int used = (int)info.dwCursorPosition.Y - (int)topRow;
+                if (used < 0 || topRow < 0) {
+                    // Buffer scrolled or API failed: re-anchor below.
+                    topRow = info.dwCursorPosition.Y;
+                    prevRows = 0;
+                }
+                else {
+                    prevRows = used;
+                }
+            }
+            else {
+                topRow = -1;
+                prevRows = 0;
+            }
             needRender = false;
         }
 
