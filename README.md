@@ -95,12 +95,13 @@ msbuild Injector\Injector.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:Pl
 1. 将 `FocusCheat.dll` 和 `Injector.exe` **放在同一个文件夹**中。
 2. 启动你的测试目标程序。
 3. **右键** `Injector.exe` → **“以管理员身份运行”**。
-4. 按提示输入目标 PID 或进程名（或直接用参数指定）：
+4. 选择目标：直接运行时会打开交互式进程选择器（方向键移动、回车确认、`/` 过滤、序号跳转、ESC 取消），或用参数直接指定：
    ```cmd
    Injector.exe --list
-   Injector.exe --pid 1234
+   Injector.exe --pid 1234 --yes
    Injector.exe --process <进程映像名>
    ```
+   完整选项见 `Injector.exe --help`（`--color`、`--quiet`、`--yes`、`--page-size` 等）。
 5. 控制台输出 `DLL injected successfully!` 即表示成功。
 6. （可选）如需启用自定义钩子，将 `FocusCheat.example.ini` 复制为 `FocusCheat.ini` 并按注释填写你自有程序的值。
 

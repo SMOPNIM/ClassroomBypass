@@ -1,5 +1,6 @@
 ﻿#include <windows.h>
 #include <tlhelp32.h>
+#include <conio.h>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -8,11 +9,17 @@
 
 // Generic DLL injector.
 // No hardcoded target process: the target is chosen via command-line
-// arguments or an interactive prompt at runtime.
+// arguments or an interactive picker at runtime.
 
 struct ProcessEntry {
     DWORD pid = 0;
     std::wstring name;
+};
+
+enum ColorMode {
+    COLOR_AUTO = 0,
+    COLOR_ALWAYS = 1,
+    COLOR_NEVER = 2,
 };
 
 struct Options {
@@ -20,23 +27,167 @@ struct Options {
     std::wstring processName;
     std::wstring dllPath;
     bool listOnly = false;
+    bool quiet = false;
+    bool assumeYes = false;
+    int pageSize = 20;
+    ColorMode colorMode = COLOR_AUTO;
 };
+
+// ============================================================
+// Console UI helpers (colors auto-disabled when piped)
+// ============================================================
+namespace ui {
+
+static HANDLE hOut = NULL;
+static WORD savedAttr = 0;
+static bool colorOn = false;
+static bool quiet = false;
+
+static bool IsConsoleHandle(HANDLE h) {
+    if (!h || h == INVALID_HANDLE_VALUE) return false;
+    DWORD mode = 0;
+    return GetConsoleMode(h, &mode) != FALSE;
+}
+
+bool StdinIsConsole() { return IsConsoleHandle(GetStdHandle(STD_INPUT_HANDLE)); }
+bool StdoutIsConsole() { return IsConsoleHandle(GetStdHandle(STD_OUTPUT_HANDLE)); }
+
+void Init(const Options& opt) {
+    quiet = opt.quiet;
+    hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (opt.colorMode == COLOR_ALWAYS) {
+        colorOn = true;
+    }
+    else if (opt.colorMode == COLOR_NEVER) {
+        colorOn = false;
+    }
+    else {
+        colorOn = StdoutIsConsole();
+    }
+    if (colorOn && hOut && hOut != INVALID_HANDLE_VALUE) {
+        CONSOLE_SCREEN_BUFFER_INFO info;
+        if (GetConsoleScreenBufferInfo(hOut, &info)) {
+            savedAttr = info.wAttributes;
+        }
+        else {
+            colorOn = false;
+        }
+    }
+}
+
+void SetColor(WORD attr) {
+    if (colorOn) SetConsoleTextAttribute(hOut, attr);
+}
+
+void ResetColor() {
+    if (colorOn) SetConsoleTextAttribute(hOut, savedAttr);
+}
+
+void Write(const std::wstring& s) { std::wcout << s; }
+void WriteLine(const std::wstring& s) { std::wcout << s << std::endl; }
+
+void Info(const std::wstring& s) { WriteLine(s); }
+
+void Success(const std::wstring& s) {
+    SetColor(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+    WriteLine(s);
+    ResetColor();
+}
+
+void Warn(const std::wstring& s) {
+    SetColor(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+    WriteLine(s);
+    ResetColor();
+}
+
+void Error(const std::wstring& s) {
+    SetColor(FOREGROUND_RED | FOREGROUND_INTENSITY);
+    WriteLine(s);
+    ResetColor();
+}
+
+void Dim(const std::wstring& s) {
+    SetColor(FOREGROUND_INTENSITY);
+    WriteLine(s);
+    ResetColor();
+}
+
+void Banner() {
+    if (quiet) return;
+    SetColor(FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
+    WriteLine(L"============================================================");
+    WriteLine(L"  Injector - generic DLL injector");
+    WriteLine(L"============================================================");
+    ResetColor();
+}
+
+void Step(int index, int total, const std::wstring& label) {
+    wchar_t buf[32];
+    swprintf_s(buf, L"[%d/%d] ", index, total);
+    Write(buf);
+    WriteLine(label + L" ...");
+}
+
+void StepOk() {
+    SetColor(FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+    WriteLine(L"        OK");
+    ResetColor();
+}
+
+void StepFail(const std::wstring& reason) {
+    SetColor(FOREGROUND_RED | FOREGROUND_INTENSITY);
+    WriteLine(L"        FAILED: " + reason);
+    ResetColor();
+}
+
+} // namespace ui
+
+static std::wstring WinErrorMessage(DWORD code) {
+    wchar_t* buf = NULL;
+    DWORD n = FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                            FORMAT_MESSAGE_IGNORE_INSERTS,
+                            NULL, code, 0, (LPWSTR)&buf, 0, NULL);
+    std::wstring msg;
+    if (n && buf) {
+        msg.assign(buf, n);
+        LocalFree(buf);
+        // Trim trailing whitespace/newlines.
+        while (!msg.empty() && std::iswspace(msg.back())) msg.pop_back();
+    }
+    if (msg.empty()) {
+        wchar_t tmp[64];
+        swprintf_s(tmp, L"error code %lu", (unsigned long)code);
+        msg = tmp;
+    }
+    return msg;
+}
 
 static void PrintUsage() {
     std::wcout << L"Usage:\n"
-               << L"  Injector.exe [--pid <PID> | --process <name.exe>] [--dll <path>]\n"
-               << L"  Injector.exe [--dll <path>] <PID | name.exe>\n"
+               << L"  Injector.exe [--pid <PID> | --process <name>] [--dll <path>]\n"
+               << L"  Injector.exe [--dll <path>] <PID | name>\n"
                << L"  Injector.exe --list\n"
                << L"\n"
-               << L"Options:\n"
+               << L"Target selection:\n"
                << L"  --pid, -p <PID>        Target process ID\n"
-               << L"  --process, -n <name>   Target process image name (e.g. TARGET.EXE)\n"
+               << L"  --process, -n <name>   Target process image name\n"
                << L"  --dll, -d <path>       DLL to inject (default: FocusCheat.dll next to this EXE)\n"
                << L"  --list, -l             List running processes and exit\n"
+               << L"\n"
+               << L"Interface:\n"
+               << L"  --color=auto|always|never   Color output (default: auto = TTY only)\n"
+               << L"  --quiet, -q            Suppress banner and hints\n"
+               << L"  --yes, -y              Skip confirmation prompt\n"
+               << L"  --page-size <N>        Rows per page in the picker (default: 20)\n"
                << L"  --help, -h             Show this help\n"
                << L"\n"
-               << L"If no target is given, running processes are listed and you are\n"
-               << L"prompted to enter a PID or process image name.\n";
+               << L"Interactive picker keys: Up/Down = move, PgUp/PgDn = page,\n"
+               << L"  digits = jump to row, / = filter, Enter = confirm, Esc = cancel.\n"
+               << L"\n"
+               << L"Examples:\n"
+               << L"  Injector.exe --list\n"
+               << L"  Injector.exe --pid 1234 --yes\n"
+               << L"  Injector.exe --process <image-name> --dll C:\\path\\to\\FocusCheat.dll\n";
 }
 
 static std::wstring Trim(const std::wstring& s) {
@@ -53,6 +204,37 @@ static bool IsAllDigits(const std::wstring& s) {
         if (!std::iswdigit(c)) return false;
     }
     return true;
+}
+
+static std::wstring ToLower(const std::wstring& s) {
+    std::wstring out = s;
+    for (wchar_t& c : out) c = std::towlower(c);
+    return out;
+}
+
+// Approximate terminal cell width (CJK characters count as 2).
+static int CellWidth(wchar_t c) {
+    if (c < 0x1100) return 1;
+    if (c <= 0x115F) return 2;
+    if (c >= 0x2E80 && c <= 0xA4CF) return 2;
+    if (c >= 0xAC00 && c <= 0xD7A3) return 2;
+    if (c >= 0xF900 && c <= 0xFAFF) return 2;
+    if (c >= 0xFE30 && c <= 0xFE4F) return 2;
+    if (c >= 0xFF00 && c <= 0xFF60) return 2;
+    if (c >= 0xFFE0 && c <= 0xFFE6) return 2;
+    return 1;
+}
+
+static int DisplayWidth(const std::wstring& s) {
+    int w = 0;
+    for (wchar_t c : s) w += CellWidth(c);
+    return w;
+}
+
+static std::wstring PadRight(const std::wstring& s, int width) {
+    int w = DisplayWidth(s);
+    if (w >= width) return s;
+    return s + std::wstring((size_t)(width - w), L' ');
 }
 
 // Get the full path of the DLL located in the same directory as this EXE
@@ -117,47 +299,293 @@ static bool ProcessExists(DWORD pid) {
     return true;
 }
 
-// Resolve a process image name to a PID. If several instances match,
-// the user is asked to pick one.
-static DWORD ResolveNameToPid(const std::wstring& name) {
-    std::vector<DWORD> pids = FindPidsByName(name);
-    if (pids.empty()) return 0;
-    if (pids.size() == 1) return pids[0];
-
-    std::wcout << L"Multiple processes named \"" << name << L"\" found:\n";
-    for (DWORD pid : pids) {
-        std::wcout << L"  PID " << pid << L"\n";
+static std::wstring ProcessNameByPid(const std::vector<ProcessEntry>& all, DWORD pid) {
+    for (const auto& e : all) {
+        if (e.pid == pid) return e.name;
     }
-    std::wcout << L"Enter PID: ";
-    std::wstring input;
-    std::getline(std::wcin, input);
-    input = Trim(input);
-    if (!IsAllDigits(input)) return 0;
-    DWORD pid = static_cast<DWORD>(std::wcstoul(input.c_str(), nullptr, 10));
-    if (std::find(pids.begin(), pids.end(), pid) == pids.end()) return 0;
-    return pid;
+    return L"";
 }
 
-// Interactive fallback: list processes and prompt for PID or image name.
-static DWORD PromptForTarget() {
-    std::vector<ProcessEntry> procs = ListAllProcesses();
-    if (procs.empty()) {
-        std::wcout << L"Unable to enumerate processes." << std::endl;
-        return 0;
+// ============================================================
+// Interactive TUI picker
+// ============================================================
+namespace picker {
+
+static void MoveCursorUp(int lines) {
+    if (lines <= 0) return;
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (!GetConsoleScreenBufferInfo(h, &info)) return;
+    COORD pos = info.dwCursorPosition;
+    pos.Y = (SHORT)(pos.Y > lines ? pos.Y - lines : 0);
+    pos.X = 0;
+    SetConsoleCursorPosition(h, pos);
+}
+
+// Render the picker block; returns the number of printed lines.
+static int Render(const std::vector<ProcessEntry>& rows, const std::vector<size_t>& view,
+                  size_t selected, size_t page, size_t pageSize,
+                  const std::wstring& filter, const std::wstring& numBuf) {
+    int lines = 0;
+    auto emit = [&](const std::wstring& s) {
+        std::wcout << s << L"\n";
+        ++lines;
+    };
+
+    size_t totalPages = (view.size() + pageSize - 1) / pageSize;
+    if (totalPages == 0) totalPages = 1;
+    if (page >= totalPages) page = totalPages - 1;
+
+    wchar_t head[128];
+    swprintf_s(head, L"Select target process  (page %llu/%llu, %llu match%s)",
+               (unsigned long long)(page + 1), (unsigned long long)totalPages,
+               (unsigned long long)view.size(), view.size() == 1 ? L"" : L"es");
+    ui::SetColor(FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY);
+    std::wcout << head << L"\n";
+    ui::ResetColor();
+    ++lines;
+
+    if (!filter.empty()) {
+        ui::Write(L"Filter: ");
+        ui::Write(filter);
+        ui::Write(L"\n");
+        ++lines;
     }
-    std::wcout << L"Running processes:\n";
-    for (const auto& e : procs) {
-        std::wcout << L"  " << e.pid << L"  " << e.name << L"\n";
+
+    emit(L"  #     PID       Image Name");
+    emit(L"  --    --------  ------------------------------");
+
+    size_t nameWidth = 30;
+    for (size_t i = page * pageSize; i < view.size() && i < (page + 1) * pageSize; ++i) {
+        const ProcessEntry& e = rows[view[i]];
+        wchar_t row[128];
+        swprintf_s(row, L"%c %-4llu  %-8lu  ", (i == selected ? L'>' : L' '),
+                   (unsigned long long)(i + 1), (unsigned long)e.pid);
+        std::wstring line(row);
+        std::wstring nm = e.name;
+        if (DisplayWidth(nm) > (int)nameWidth) {
+            // Truncate wide names, keeping display width in range.
+            std::wstring cut;
+            int w = 0;
+            for (wchar_t c : nm) {
+                int cw = CellWidth(c);
+                if (w + cw > (int)nameWidth - 1) break;
+                cut += c;
+                w += cw;
+            }
+            nm = cut + L"…";
+        }
+        line += PadRight(nm, (int)nameWidth);
+        if (i == selected) {
+            ui::SetColor(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY); // yellow highlight
+            std::wcout << line << L"\n";
+            ui::ResetColor();
+        }
+        else {
+            std::wcout << line << L"\n";
+        }
+        ++lines;
     }
-    std::wcout << L"\nEnter target PID or process image name: ";
+
+    std::wstring status = L"Up/Down move  PgUp/PgDn page  digits jump  / filter  Enter OK  Esc cancel";
+    if (!numBuf.empty()) status = L"Row: " + numBuf + L"  (Enter to jump)";
+    ui::SetColor(FOREGROUND_INTENSITY);
+    std::wcout << status << L"\n";
+    ui::ResetColor();
+    ++lines;
+
+    std::wcout.flush();
+    return lines;
+}
+
+// Filter rows by case-insensitive substring; returns indices into rows.
+static std::vector<size_t> ApplyFilter(const std::vector<ProcessEntry>& rows,
+                                       const std::wstring& filter) {
+    std::vector<size_t> view;
+    std::wstring f = ToLower(filter);
+    for (size_t i = 0; i < rows.size(); ++i) {
+        if (f.empty() || ToLower(rows[i].name).find(f) != std::wstring::npos) {
+            view.push_back(i);
+        }
+    }
+    return view;
+}
+
+// Line-based fallback when stdin is not a console (piped input).
+static DWORD FallbackPick(const std::vector<ProcessEntry>& rows) {
+    for (size_t i = 0; i < rows.size(); ++i) {
+        wchar_t buf[128];
+        swprintf_s(buf, L"  %llu  %lu  %s\n", (unsigned long long)(i + 1),
+                   (unsigned long)rows[i].pid, rows[i].name.c_str());
+        std::wcout << buf;
+    }
+    std::wcout << L"Enter row number, PID or image name (empty to cancel): ";
     std::wstring input;
     std::getline(std::wcin, input);
     input = Trim(input);
     if (input.empty()) return 0;
     if (IsAllDigits(input)) {
-        return static_cast<DWORD>(std::wcstoul(input.c_str(), nullptr, 10));
+        unsigned long n = std::wcstoul(input.c_str(), nullptr, 10);
+        if (n >= 1 && n <= rows.size()) return rows[n - 1].pid;
+        if (ProcessExists((DWORD)n)) return (DWORD)n;
+        return 0;
     }
-    return ResolveNameToPid(input);
+    std::vector<DWORD> pids = FindPidsByName(input);
+    if (pids.size() == 1) return pids[0];
+    return 0;
+}
+
+// Returns selected PID, or 0 on cancel/failure.
+DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilter,
+          int pageSize) {
+    if (rows.empty()) return 0;
+    if (pageSize <= 0) pageSize = 20;
+
+    if (!ui::StdinIsConsole() || !ui::StdoutIsConsole()) {
+        return FallbackPick(rows);
+    }
+
+    std::wstring filter = initialFilter;
+    std::vector<size_t> view = ApplyFilter(rows, filter);
+    size_t selected = 0;
+    size_t page = 0;
+    std::wstring numBuf;
+    int prevLines = 0;
+    bool first = true;
+
+    for (;;) {
+        size_t totalPages = (view.size() + (size_t)pageSize - 1) / (size_t)pageSize;
+        if (totalPages == 0) totalPages = 1;
+        if (selected >= view.size()) selected = view.empty() ? 0 : view.size() - 1;
+        page = view.empty() ? 0 : selected / (size_t)pageSize;
+
+        if (!first) MoveCursorUp(prevLines);
+        first = false;
+        prevLines = Render(rows, view, selected, page, (size_t)pageSize, filter, numBuf);
+
+        int ch = _getch();
+        if (ch == 27) { // Esc
+            if (!numBuf.empty()) {
+                numBuf.clear();
+                continue;
+            }
+            MoveCursorUp(0);
+            std::wcout << L"\n";
+            return 0;
+        }
+        if (ch == 13) { // Enter
+            if (!numBuf.empty()) {
+                unsigned long n = std::wcstoul(numBuf.c_str(), nullptr, 10);
+                numBuf.clear();
+                if (n >= 1 && n <= rows.size()) return rows[n - 1].pid;
+                continue;
+            }
+            if (!view.empty()) return rows[view[selected]].pid;
+            return 0;
+        }
+        if (ch == 0 || ch == 224) { // extended key
+            int code = _getch();
+            numBuf.clear();
+            if (code == 72) { // Up
+                if (selected > 0) --selected;
+            }
+            else if (code == 80) { // Down
+                if (selected + 1 < view.size()) ++selected;
+            }
+            else if (code == 73 || code == 75) { // PgUp / Left
+                selected = (selected >= (size_t)pageSize) ? selected - (size_t)pageSize : 0;
+            }
+            else if (code == 81 || code == 77) { // PgDn / Right
+                selected = selected + (size_t)pageSize < view.size()
+                               ? selected + (size_t)pageSize
+                               : (view.empty() ? 0 : view.size() - 1);
+            }
+            else if (code == 71) { // Home
+                selected = 0;
+            }
+            else if (code == 79) { // End
+                selected = view.empty() ? 0 : view.size() - 1;
+            }
+            continue;
+        }
+        if (ch == 8) { // Backspace
+            if (!numBuf.empty()) numBuf.pop_back();
+            continue;
+        }
+        if (ch == '/') {
+            numBuf.clear();
+            ui::Write(L"\nFilter (empty clears): ");
+            std::wstring f;
+            std::getline(std::wcin, f);
+            filter = Trim(f);
+            view = ApplyFilter(rows, filter);
+            selected = 0;
+            first = true; // filter prompt broke cursor tracking; reprint fresh
+            continue;
+        }
+        if (ch >= '0' && ch <= '9') {
+            numBuf += (wchar_t)ch;
+            continue;
+        }
+        // Ignore other keys.
+    }
+}
+
+} // namespace picker
+
+// Resolve a process image name to a PID (interactive narrowing on multiples).
+static DWORD ResolveNameToPid(const std::wstring& name, const Options& opt) {
+    std::vector<DWORD> pids = FindPidsByName(name);
+    if (pids.empty()) return 0;
+    if (pids.size() == 1) return pids[0];
+
+    if (!ui::StdinIsConsole()) {
+        ui::Error(L"Multiple processes named \"" + name + L"\" found; re-run with --pid:");
+        for (DWORD pid : pids) {
+            wchar_t buf[64];
+            swprintf_s(buf, L"  PID %lu", (unsigned long)pid);
+            ui::WriteLine(buf);
+        }
+        return 0;
+    }
+    std::vector<ProcessEntry> all = ListAllProcesses();
+    std::vector<ProcessEntry> cands;
+    for (DWORD pid : pids) {
+        ProcessEntry e;
+        e.pid = pid;
+        e.name = ProcessNameByPid(all, pid);
+        if (e.name.empty()) e.name = name;
+        cands.push_back(e);
+    }
+    ui::Info(L"Multiple matches; pick one:");
+    return picker::Run(cands, L"", opt.pageSize);
+}
+
+// Interactive fallback: pick from the full process list.
+static DWORD PromptForTarget(const Options& opt) {
+    std::vector<ProcessEntry> procs = ListAllProcesses();
+    if (procs.empty()) {
+        ui::Error(L"Unable to enumerate processes.");
+        return 0;
+    }
+    return picker::Run(procs, L"", opt.pageSize);
+}
+
+static bool ParseColorValue(const std::wstring& v, Options& opt) {
+    std::wstring lower = ToLower(Trim(v));
+    if (lower == L"auto") {
+        opt.colorMode = COLOR_AUTO;
+        return true;
+    }
+    if (lower == L"always") {
+        opt.colorMode = COLOR_ALWAYS;
+        return true;
+    }
+    if (lower == L"never") {
+        opt.colorMode = COLOR_NEVER;
+        return true;
+    }
+    return false;
 }
 
 static bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
@@ -170,7 +598,17 @@ static bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
         else if (a == L"--list" || a == L"-l") {
             opt.listOnly = true;
         }
-        else if ((a == L"--pid" || a == L"-p") && i + 1 < argc) {
+        else if (a == L"--quiet" || a == L"-q") {
+            opt.quiet = true;
+        }
+        else if (a == L"--yes" || a == L"-y") {
+            opt.assumeYes = true;
+        }
+        else if (a == L"--pid" || a == L"-p") {
+            if (i + 1 >= argc) {
+                std::wcout << L"Option " << a << L" requires a value." << std::endl;
+                return false;
+            }
             std::wstring v = Trim(argv[++i]);
             if (!IsAllDigits(v)) {
                 std::wcout << L"Invalid PID value: " << v << std::endl;
@@ -178,11 +616,53 @@ static bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
             }
             opt.pid = static_cast<DWORD>(std::wcstoul(v.c_str(), nullptr, 10));
         }
-        else if ((a == L"--process" || a == L"-n") && i + 1 < argc) {
+        else if (a == L"--process" || a == L"-n") {
+            if (i + 1 >= argc) {
+                std::wcout << L"Option " << a << L" requires a value." << std::endl;
+                return false;
+            }
             opt.processName = Trim(argv[++i]);
         }
-        else if ((a == L"--dll" || a == L"-d") && i + 1 < argc) {
+        else if (a == L"--dll" || a == L"-d") {
+            if (i + 1 >= argc) {
+                std::wcout << L"Option " << a << L" requires a value." << std::endl;
+                return false;
+            }
             opt.dllPath = Trim(argv[++i]);
+        }
+        else if (a == L"--page-size") {
+            if (i + 1 >= argc) {
+                std::wcout << L"Option " << a << L" requires a value." << std::endl;
+                return false;
+            }
+            std::wstring v = Trim(argv[++i]);
+            if (!IsAllDigits(v) || v == L"0") {
+                std::wcout << L"Invalid page size: " << v << std::endl;
+                return false;
+            }
+            opt.pageSize = (int)std::wcstoul(v.c_str(), nullptr, 10);
+        }
+        else if (a.rfind(L"--color", 0) == 0) {
+            std::wstring v;
+            if (a.length() > 7 && a[7] == L'=') {
+                v = a.substr(8);
+            }
+            else if (a == L"--color") {
+                if (i + 1 >= argc) {
+                    std::wcout << L"Option --color requires a value." << std::endl;
+                    return false;
+                }
+                v = argv[++i];
+            }
+            else {
+                std::wcout << L"Unknown argument: " << a << std::endl;
+                PrintUsage();
+                return false;
+            }
+            if (!ParseColorValue(v, opt)) {
+                std::wcout << L"Invalid color mode (auto|always|never): " << v << std::endl;
+                return false;
+            }
         }
         else if (!a.empty() && a[0] != L'-') {
             // Positional argument: PID or process image name.
@@ -203,12 +683,27 @@ static bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
     return true;
 }
 
+// Press-any-key pause, interactive consoles only.
+static void WaitForExitKey(const Options& opt) {
+    if (opt.assumeYes) return;
+    if (!ui::StdinIsConsole()) return;
+    ui::Dim(L"Press any key to exit...");
+    _getch();
+}
+
+static int Fail(const Options& opt, const std::wstring& msg) {
+    ui::Error(msg);
+    WaitForExitKey(opt);
+    return 1;
+}
+
 int wmain(int argc, wchar_t** argv) {
     Options opt;
     if (!ParseArgs(argc, argv, opt)) {
-        system("pause");
+        WaitForExitKey(opt);
         return 1;
     }
+    ui::Init(opt);
 
     if (opt.listOnly) {
         std::vector<ProcessEntry> procs = ListAllProcesses();
@@ -218,92 +713,122 @@ int wmain(int argc, wchar_t** argv) {
         return 0;
     }
 
+    bool interactive = ui::StdinIsConsole() && ui::StdoutIsConsole();
+    if (interactive) ui::Banner();
+
     DWORD pid = 0;
+    std::wstring targetDesc;
     if (opt.pid != 0) {
         pid = opt.pid;
         if (!ProcessExists(pid)) {
-            std::wcout << L"Process not found (PID " << pid << L")." << std::endl;
-            system("pause");
-            return 1;
+            return Fail(opt, L"Process not found (PID " + std::to_wstring(pid) + L").");
         }
+        targetDesc = L"PID " + std::to_wstring(pid);
     }
     else if (!opt.processName.empty()) {
-        pid = ResolveNameToPid(opt.processName);
+        pid = ResolveNameToPid(opt.processName, opt);
         if (pid == 0) {
-            std::wcout << L"Process not found: " << opt.processName << std::endl;
-            system("pause");
-            return 1;
+            return Fail(opt, L"Process not found: " + opt.processName);
         }
+        targetDesc = opt.processName + L" (PID " + std::to_wstring(pid) + L")";
     }
     else {
-        pid = PromptForTarget();
+        if (!interactive) {
+            return Fail(opt, L"No target given. Use --pid, --process, or run in a console for the picker.");
+        }
+        pid = PromptForTarget(opt);
         if (pid == 0) {
-            std::wcout << L"No valid target selected." << std::endl;
-            system("pause");
-            return 1;
+            return Fail(opt, L"No valid target selected.");
         }
         if (!ProcessExists(pid)) {
-            std::wcout << L"Process not found (PID " << pid << L")." << std::endl;
-            system("pause");
-            return 1;
+            return Fail(opt, L"Process not found (PID " + std::to_wstring(pid) + L").");
         }
+        std::vector<ProcessEntry> all = ListAllProcesses();
+        targetDesc = ProcessNameByPid(all, pid) + L" (PID " + std::to_wstring(pid) + L")";
     }
-    std::wcout << L"Target process PID: " << pid << std::endl;
+    ui::Success(L"Target: " + targetDesc);
 
     // DLL path (explicit --dll or auto-located next to Injector.exe)
     std::wstring dllPath = opt.dllPath.empty() ? GetDefaultDllPath() : opt.dllPath;
     if (GetFileAttributes(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        std::wcout << L"DLL not found: " << dllPath << std::endl;
-        system("pause");
-        return 1;
+        return Fail(opt, L"DLL not found: " + dllPath);
     }
-    std::wcout << L"DLL path: " << dllPath << std::endl;
+    ui::Info(L"DLL: " + dllPath);
+
+    // Confirmation (interactive only, unless --yes).
+    if (interactive && !opt.assumeYes) {
+        ui::Write(L"Proceed with injection? [Y/n] ");
+        std::wstring answer;
+        std::getline(std::wcin, answer);
+        answer = ToLower(Trim(answer));
+        if (!answer.empty() && answer != L"y" && answer != L"yes") {
+            ui::Warn(L"Cancelled.");
+            return 1;
+        }
+    }
 
     // Open the target process
+    ui::Step(1, 4, L"Open process");
     HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!hProcess) {
-        std::wcout << L"Failed to open process. Please run as administrator." << std::endl;
-        system("pause");
+        DWORD err = GetLastError();
+        ui::StepFail(L"cannot open process (" + WinErrorMessage(err) +
+                     L"). Try running as administrator.");
+        WaitForExitKey(opt);
         return 1;
     }
+    ui::StepOk();
 
     // Allocate memory in the target process and write the DLL path
+    ui::Step(2, 4, L"Allocate remote memory");
     size_t pathSize = (dllPath.length() + 1) * sizeof(wchar_t);
     LPVOID pRemoteMem = VirtualAllocEx(hProcess, NULL, pathSize, MEM_COMMIT, PAGE_READWRITE);
     if (!pRemoteMem) {
-        std::wcout << L"Memory allocation failed!" << std::endl;
+        DWORD err = GetLastError();
+        ui::StepFail(WinErrorMessage(err));
         CloseHandle(hProcess);
-        system("pause");
+        WaitForExitKey(opt);
         return 1;
     }
+    ui::StepOk();
+
+    ui::Step(3, 4, L"Write DLL path");
     if (!WriteProcessMemory(hProcess, pRemoteMem, dllPath.c_str(), pathSize, NULL)) {
-        std::wcout << L"WriteProcessMemory failed. Error code: " << GetLastError() << std::endl;
+        DWORD err = GetLastError();
+        ui::StepFail(WinErrorMessage(err));
         VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
         CloseHandle(hProcess);
-        system("pause");
+        WaitForExitKey(opt);
         return 1;
     }
+    ui::StepOk();
 
     // Create a remote thread to load the DLL (LoadLibraryW)
+    ui::Step(4, 4, L"Create remote thread (LoadLibraryW)");
     HMODULE hKernel32 = GetModuleHandle(L"kernel32.dll");
     FARPROC pLoadLibrary = GetProcAddress(hKernel32, "LoadLibraryW");
 
     HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
         (LPTHREAD_START_ROUTINE)pLoadLibrary, pRemoteMem, 0, NULL);
 
-    if (hThread) {
-        WaitForSingleObject(hThread, INFINITE);
-        std::wcout << L"DLL injected successfully!" << std::endl;
-        CloseHandle(hThread);
+    if (!hThread) {
+        DWORD err = GetLastError();
+        ui::StepFail(WinErrorMessage(err));
+        VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        WaitForExitKey(opt);
+        return 1;
     }
-    else {
-        std::wcout << L"DLL injection failed. Error code: " << GetLastError() << std::endl;
-    }
+    ui::StepOk();
+
+    WaitForSingleObject(hThread, INFINITE);
+    CloseHandle(hThread);
 
     // Cleanup
     VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
     CloseHandle(hProcess);
 
-    system("pause");
+    ui::Success(L"DLL injected successfully!");
+    WaitForExitKey(opt);
     return 0;
 }
