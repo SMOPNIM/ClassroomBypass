@@ -342,6 +342,26 @@ static void MoveCursorUp(int lines) {
     SetConsoleCursorPosition(h, pos);
 }
 
+// Erase `lines` console rows starting at the current cursor row.
+// The cursor ends up back at the start row.
+static void ClearRows(int lines) {
+    if (lines <= 0) return;
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (!GetConsoleScreenBufferInfo(h, &info)) return;
+    COORD top = info.dwCursorPosition;
+    top.X = 0;
+    DWORD width = (DWORD)info.dwSize.X;
+    DWORD written = 0;
+    COORD pos = top;
+    for (int i = 0; i < lines; ++i) {
+        FillConsoleOutputCharacterW(h, L' ', width, pos, &written);
+        FillConsoleOutputAttribute(h, info.wAttributes, width, pos, &written);
+        pos.Y++;
+    }
+    SetConsoleCursorPosition(h, top);
+}
+
 // Render the picker block; returns the number of printed lines.
 static int Render(const std::vector<ProcessEntry>& rows, const std::vector<size_t>& view,
                   size_t selected, size_t page, size_t pageSize,
@@ -497,7 +517,10 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
             if (selected >= view.size()) selected = view.empty() ? 0 : view.size() - 1;
             page = view.empty() ? 0 : selected / (size_t)pageSize;
 
-            if (!first) MoveCursorUp(prevLines);
+            if (!first) {
+                MoveCursorUp(prevLines);
+                ClearRows(prevLines); // wipe the old frame so shrinking views leave no stale rows
+            }
             first = false;
             prevLines = Render(rows, view, selected, page, (size_t)pageSize, filter);
             needRender = false;
