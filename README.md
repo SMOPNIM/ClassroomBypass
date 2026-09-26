@@ -99,7 +99,7 @@ msbuild Injector\Injector.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:Pl
    ```cmd
    Injector.exe --list
    Injector.exe --pid 1234
-   Injector.exe --process TARGET.EXE
+   Injector.exe --process <进程映像名>
    ```
 5. 控制台输出 `DLL injected successfully!` 即表示成功。
 6. （可选）如需启用自定义钩子，将 `FocusCheat.example.ini` 复制为 `FocusCheat.ini` 并按注释填写你自有程序的值。
