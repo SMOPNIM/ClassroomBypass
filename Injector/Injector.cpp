@@ -140,6 +140,26 @@ void StepFail(const std::wstring& reason) {
     ResetColor();
 }
 
+void HideCursor() {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!h || h == INVALID_HANDLE_VALUE) return;
+    CONSOLE_CURSOR_INFO info;
+    if (GetConsoleCursorInfo(h, &info)) {
+        info.bVisible = FALSE;
+        SetConsoleCursorInfo(h, &info);
+    }
+}
+
+void ShowCursor() {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!h || h == INVALID_HANDLE_VALUE) return;
+    CONSOLE_CURSOR_INFO info;
+    if (GetConsoleCursorInfo(h, &info)) {
+        info.bVisible = TRUE;
+        SetConsoleCursorInfo(h, &info);
+    }
+}
+
 } // namespace ui
 
 static std::wstring WinErrorMessage(DWORD code) {
@@ -452,24 +472,35 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
     std::wstring numBuf;
     int prevLines = 0;
     bool first = true;
+    bool needRender = true;
+
+    // Hide the blinking cursor for the whole picker session; it is
+    // restored on every exit path by the guard's destructor.
+    struct CursorGuard {
+        CursorGuard() { ui::HideCursor(); }
+        ~CursorGuard() { ui::ShowCursor(); }
+    } cursorGuard;
 
     for (;;) {
-        size_t totalPages = (view.size() + (size_t)pageSize - 1) / (size_t)pageSize;
-        if (totalPages == 0) totalPages = 1;
-        if (selected >= view.size()) selected = view.empty() ? 0 : view.size() - 1;
-        page = view.empty() ? 0 : selected / (size_t)pageSize;
+        if (needRender) {
+            size_t totalPages = (view.size() + (size_t)pageSize - 1) / (size_t)pageSize;
+            if (totalPages == 0) totalPages = 1;
+            if (selected >= view.size()) selected = view.empty() ? 0 : view.size() - 1;
+            page = view.empty() ? 0 : selected / (size_t)pageSize;
 
-        if (!first) MoveCursorUp(prevLines);
-        first = false;
-        prevLines = Render(rows, view, selected, page, (size_t)pageSize, filter, numBuf);
+            if (!first) MoveCursorUp(prevLines);
+            first = false;
+            prevLines = Render(rows, view, selected, page, (size_t)pageSize, filter, numBuf);
+            needRender = false;
+        }
 
         int ch = _getch();
         if (ch == 27) { // Esc
             if (!numBuf.empty()) {
                 numBuf.clear();
+                needRender = true;
                 continue;
             }
-            MoveCursorUp(0);
             std::wcout << L"\n";
             return 0;
         }
@@ -478,6 +509,7 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
                 unsigned long n = std::wcstoul(numBuf.c_str(), nullptr, 10);
                 numBuf.clear();
                 if (n >= 1 && n <= rows.size()) return rows[n - 1].pid;
+                needRender = true;
                 continue;
             }
             if (!view.empty()) return rows[view[selected]].pid;
@@ -485,6 +517,8 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
         }
         if (ch == 0 || ch == 224) { // extended key
             int code = _getch();
+            size_t old = selected;
+            bool bufWas = !numBuf.empty();
             numBuf.clear();
             if (code == 72) { // Up
                 if (selected > 0) --selected;
@@ -506,28 +540,36 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
             else if (code == 79) { // End
                 selected = view.empty() ? 0 : view.size() - 1;
             }
+            if (selected != old || bufWas) needRender = true;
             continue;
         }
         if (ch == 8) { // Backspace
-            if (!numBuf.empty()) numBuf.pop_back();
+            if (!numBuf.empty()) {
+                numBuf.pop_back();
+                needRender = true;
+            }
             continue;
         }
         if (ch == '/') {
             numBuf.clear();
+            ui::ShowCursor(); // line input needs a visible cursor
             ui::Write(L"\nFilter (empty clears): ");
             std::wstring f;
             std::getline(std::wcin, f);
+            ui::HideCursor();
             filter = Trim(f);
             view = ApplyFilter(rows, filter);
             selected = 0;
             first = true; // filter prompt broke cursor tracking; reprint fresh
+            needRender = true;
             continue;
         }
         if (ch >= '0' && ch <= '9') {
             numBuf += (wchar_t)ch;
+            needRender = true;
             continue;
         }
-        // Ignore other keys.
+        // Ignore other keys (no redraw).
     }
 }
 
