@@ -101,8 +101,9 @@ msbuild Injector\Injector.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:Pl
    Injector.exe --pid 1234 --yes
    Injector.exe --process <进程映像名>
    ```
-   完整选项见 `Injector.exe --help`（`--color`、`--quiet`、`--yes`、`--page-size` 等）。
-5. 控制台输出 `DLL injected successfully!` 即表示成功。
+   完整选项见 `Injector.exe --help`（`--color`、`--quiet`、`--yes`、`--page-size`、`--verify` 等）。
+   同名多进程时看 **Arch 列选 x86**（注入器是 32 位，选 64 位会被明确拒绝），再看 **Window 列**确认是主程序窗口所在的进程。注完可用 `Injector.exe --verify <PID或进程名>` 复查 DLL 是否真的在目标模块表里。
+5. 控制台输出 `DLL injected successfully and verified in target modules!` 即表示成功（附带模块表校验，不是只等线程结束）。
 6. （可选）如需启用自定义钩子，将 `FocusCheat.example.ini` 复制为 `FocusCheat.ini` 并按注释填写你自有程序的值。
 
 > **提示**：不要对未获授权的第三方软件使用本工具。
@@ -133,7 +134,9 @@ Signature2=ExampleEventB
 
 ### 3. 工作原理
 
-注入时 DLL 会在目标模块内存中搜索特征字符串，找到引用它的代码位置后回溯到函数起始（`push ebp; mov ebp, esp`），用 Detours 挂上空操作钩子，使该函数直接返回、不再向外发送通知。定位失败（字符串不存在、无引用、找不到函数边界）时静默跳过该项。
+注入时 DLL 会在目标模块内存中搜索特征字符串，找到引用它的代码位置后回溯到函数起始（`push ebp; mov ebp, esp`），用 Detours 挂上空操作钩子，使该函数直接返回、不再向外发送通知。定位失败（字符串不存在、无引用、找不到函数边界）时记日志并跳过该项。
+
+注入时若配置的模块尚未加载，会启动看门线程（最多约 60 秒，每 2 秒轮询）：模块出现即补挂钩子，同时给注入后新建的线程补消息钩子。所有动作记入 DLL 同目录的 `FocusCheat.log`。
 
 ### 4. 如何找特征字符串
 
@@ -164,6 +167,13 @@ Signature2=ExampleEventB
 ### Q: 注入后系统卡顿或程序崩溃
 - 确保注入器/DLL 位数与目标进程一致，且 Detours submodule 已正确初始化（`git submodule update --init`）。尝试清理输出目录并重新编译。
 - 如启用了 `FocusCheat.ini` 自定义钩子，先移除该文件再测试，确认是否为特征串定位问题。
+
+### Q: 提示位数不匹配（Bitness mismatch）
+- 注入器是 32 位，只能注入 32 位进程。在选择器里看 **Arch 列**挑 `x86` 的那个；同名多进程时再结合 **Window 列**（主窗口标题）确认。
+
+### Q: 显示成功但目标没效果，怎么排错
+- 先跑 `Injector.exe --verify <PID或进程名>`，确认 DLL 是否真的在目标模块表里。
+- 再看 DLL 同目录的 `FocusCheat.log`：里面记录了消息钩子挂了几个线程、主窗口是否找到、自定义模块是否加载、每个 Detours 调用的返回码、看门线程是否补挂成功。把“跳过/失败”的那一行找出来，对照处理。
 
 ---
 

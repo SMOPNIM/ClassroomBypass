@@ -4,6 +4,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <map>
 #include <algorithm>
 #include <cwctype>
 
@@ -14,6 +15,8 @@
 struct ProcessEntry {
     DWORD pid = 0;
     std::wstring name;
+    std::wstring arch;     // L"x86", L"x64" or L"?" when undetermined
+    std::wstring wndTitle; // main window title, may be empty
 };
 
 enum ColorMode {
@@ -26,6 +29,7 @@ struct Options {
     DWORD pid = 0;
     std::wstring processName;
     std::wstring dllPath;
+    std::wstring verifyTarget; // PID or image name for --verify mode (no injection)
     bool listOnly = false;
     bool quiet = false;
     bool assumeYes = false;
@@ -187,12 +191,14 @@ static void PrintUsage() {
                << L"  Injector.exe [--pid <PID> | --process <name>] [--dll <path>]\n"
                << L"  Injector.exe [--dll <path>] <PID | name>\n"
                << L"  Injector.exe --list\n"
+               << L"  Injector.exe --verify <PID | name> [--dll <path>]\n"
                << L"\n"
                << L"Target selection:\n"
                << L"  --pid, -p <PID>        Target process ID\n"
                << L"  --process, -n <name>   Target process image name\n"
                << L"  --dll, -d <path>       DLL to inject (default: FocusCheat.dll next to this EXE)\n"
                << L"  --list, -l             List running processes and exit\n"
+               << L"  --verify, -V <target>  Check whether the DLL is loaded in target(s)\n"
                << L"\n"
                << L"Interface:\n"
                << L"  --color=auto|always|never   Color output (default: auto = TTY only)\n"
@@ -270,6 +276,49 @@ static std::wstring GetDefaultDllPath() {
     return path;
 }
 
+static BOOL CALLBACK EnumMainWindowProc(HWND hWnd, LPARAM lParam) {
+    auto* titles = (std::map<DWORD, std::wstring>*)lParam;
+    if (!IsWindowVisible(hWnd)) return TRUE;
+    if (GetWindow(hWnd, GW_OWNER) != NULL) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid == 0 || titles->find(pid) != titles->end()) return TRUE;
+    wchar_t text[256];
+    if (GetWindowText(hWnd, text, 256) > 0) {
+        (*titles)[pid] = text;
+    }
+    return TRUE;
+}
+
+static bool QueryWow64(HANDLE hProcess, bool& wow64) {
+    typedef BOOL(WINAPI * IsWow64ProcessFn)(HANDLE, PBOOL);
+    static IsWow64ProcessFn fn = (IsWow64ProcessFn)GetProcAddress(
+        GetModuleHandle(L"kernel32.dll"), "IsWow64Process");
+    if (!fn) return false;
+    BOOL b = FALSE;
+    if (!fn(hProcess, &b)) return false;
+    wow64 = (b != FALSE);
+    return true;
+}
+
+static void FillProcessDetails(std::vector<ProcessEntry>& entries) {
+    std::map<DWORD, std::wstring> titles;
+    EnumWindows(EnumMainWindowProc, (LPARAM)&titles);
+    for (auto& e : entries) {
+        auto it = titles.find(e.pid);
+        if (it != titles.end()) e.wndTitle = it->second;
+
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, e.pid);
+        if (h) {
+            bool wow = false;
+            if (QueryWow64(h, wow)) {
+                e.arch = wow ? L"x86" : L"x64";
+            }
+            CloseHandle(h);
+        }
+    }
+}
+
 static std::vector<ProcessEntry> ListAllProcesses() {
     std::vector<ProcessEntry> out;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -282,6 +331,7 @@ static std::vector<ProcessEntry> ListAllProcesses() {
             ProcessEntry e;
             e.pid = pe.th32ProcessID;
             e.name = pe.szExeFile;
+            e.arch = L"?";
             out.push_back(e);
         } while (Process32Next(snap, &pe));
     }
@@ -291,6 +341,7 @@ static std::vector<ProcessEntry> ListAllProcesses() {
         if (a.name != b.name) return a.name < b.name;
         return a.pid < b.pid;
     });
+    FillProcessDetails(out);
     return out;
 }
 
@@ -324,6 +375,51 @@ static std::wstring ProcessNameByPid(const std::vector<ProcessEntry>& all, DWORD
         if (e.pid == pid) return e.name;
     }
     return L"";
+}
+
+// The injector is 32-bit, so the target must be 32-bit as well.
+// Returns true when compatible (or undeterminable); false with a reason otherwise.
+static bool CheckTargetBitness(DWORD pid, std::wstring& reason) {
+    bool selfWow = false, targetWow = false;
+    if (!QueryWow64(GetCurrentProcess(), selfWow)) return true;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return true; // let the later OpenProcess report the real error
+    bool ok = QueryWow64(h, targetWow);
+    CloseHandle(h);
+    if (!ok) return true;
+    if (selfWow != targetWow) {
+        // This injector is always built 32-bit, so a mismatch means a 64-bit target.
+        reason = L"Bitness mismatch: this injector is 32-bit but the target process is 64-bit. "
+                 L"Pick the 32-bit instance (see the Arch column).";
+        return false;
+    }
+    return true;
+}
+
+static std::wstring DllFileName(const std::wstring& dllPath) {
+    size_t pos = dllPath.find_last_of(L"\\/");
+    std::wstring base = (pos == std::wstring::npos) ? dllPath : dllPath.substr(pos + 1);
+    if (base.empty()) base = L"FocusCheat.dll";
+    return base;
+}
+
+// Checks whether a module file name is loaded in the target process.
+static bool ModulePresentInProcess(DWORD pid, const std::wstring& moduleFile) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32 me;
+    me.dwSize = sizeof(me);
+    bool found = false;
+    if (Module32First(snap, &me)) {
+        do {
+            if (_wcsicmp(me.szModule, moduleFile.c_str()) == 0) {
+                found = true;
+                break;
+            }
+        } while (Module32Next(snap, &me));
+    }
+    CloseHandle(snap);
+    return found;
 }
 
 // Set while the picker runs; lets Ctrl+C cancel instead of killing.
@@ -383,30 +479,33 @@ static std::vector<FrameLine> BuildFrame(const std::vector<ProcessEntry>& rows,
         emit(L"Filter: " + filter, defAttr);
     }
 
-    emit(L"  #     PID       Image Name", defAttr);
-    emit(L"  --    --------  ------------------------------", defAttr);
+    emit(L"  #     PID       Arch  Image Name              Window Title", defAttr);
+    emit(L"  --    --------  ----  ------------------------  ------------------------------", defAttr);
 
-    const size_t nameWidth = 30;
+    const size_t nameWidth = 24;
+    const size_t titleWidth = 30;
+    auto truncateCell = [](const std::wstring& src, size_t width) {
+        if (DisplayWidth(src) <= (int)width) return src;
+        std::wstring cut;
+        int w = 0;
+        for (wchar_t c : src) {
+            int cw = CellWidth(c);
+            if (w + cw > (int)width - 1) break;
+            cut += c;
+            w += cw;
+        }
+        return cut + L"…";
+    };
     for (size_t i = page * pageSize; i < view.size() && i < (page + 1) * pageSize; ++i) {
         const ProcessEntry& e = rows[view[i]];
-        wchar_t row[128];
-        swprintf_s(row, L"%c %-4llu  %-8lu  ", (i == selected ? L'>' : L' '),
-                   (unsigned long long)(i + 1), (unsigned long)e.pid);
+        wchar_t row[160];
+        swprintf_s(row, L"%c %-4llu  %-8lu  %-4s  ", (i == selected ? L'>' : L' '),
+                   (unsigned long long)(i + 1), (unsigned long)e.pid,
+                   e.arch.c_str());
         std::wstring line(row);
-        std::wstring nm = e.name;
-        if (DisplayWidth(nm) > (int)nameWidth) {
-            // Truncate wide names, keeping display width in range.
-            std::wstring cut;
-            int w = 0;
-            for (wchar_t c : nm) {
-                int cw = CellWidth(c);
-                if (w + cw > (int)nameWidth - 1) break;
-                cut += c;
-                w += cw;
-            }
-            nm = cut + L"…";
-        }
-        line += PadRight(nm, (int)nameWidth);
+        line += PadRight(truncateCell(e.name, nameWidth), (int)nameWidth);
+        line += L"  ";
+        line += PadRight(truncateCell(e.wndTitle, titleWidth), (int)titleWidth);
         emit(line, (i == selected) ? yellow : defAttr);
     }
 
@@ -784,6 +883,13 @@ static bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
         else if (a == L"--list" || a == L"-l") {
             opt.listOnly = true;
         }
+        else if (a == L"--verify" || a == L"-V") {
+            if (i + 1 >= argc) {
+                std::wcout << L"Option " << a << L" requires a value." << std::endl;
+                return false;
+            }
+            opt.verifyTarget = Trim(argv[++i]);
+        }
         else if (a == L"--quiet" || a == L"-q") {
             opt.quiet = true;
         }
@@ -899,6 +1005,36 @@ int wmain(int argc, wchar_t** argv) {
         return 0;
     }
 
+    if (!opt.verifyTarget.empty()) {
+        std::wstring dllPath = opt.dllPath.empty() ? GetDefaultDllPath() : opt.dllPath;
+        std::wstring dllFile = DllFileName(dllPath);
+        std::vector<DWORD> targets;
+        if (IsAllDigits(opt.verifyTarget)) {
+            targets.push_back(static_cast<DWORD>(std::wcstoul(opt.verifyTarget.c_str(), nullptr, 10)));
+        }
+        else {
+            targets = FindPidsByName(opt.verifyTarget);
+            if (targets.empty()) {
+                ui::Error(L"Process not found: " + opt.verifyTarget);
+                return 1;
+            }
+        }
+        bool anyFound = false;
+        for (DWORD vpid : targets) {
+            wchar_t buf[192];
+            if (ModulePresentInProcess(vpid, dllFile)) {
+                swprintf_s(buf, L"PID %lu: %s is loaded.", (unsigned long)vpid, dllFile.c_str());
+                ui::Success(buf);
+                anyFound = true;
+            }
+            else {
+                swprintf_s(buf, L"PID %lu: %s is NOT loaded.", (unsigned long)vpid, dllFile.c_str());
+                ui::Warn(buf);
+            }
+        }
+        return anyFound ? 0 : 1;
+    }
+
     bool interactive = ui::StdinIsConsole() && ui::StdoutIsConsole();
     if (interactive) ui::Banner();
 
@@ -933,6 +1069,14 @@ int wmain(int argc, wchar_t** argv) {
         targetDesc = ProcessNameByPid(all, pid) + L" (PID " + std::to_wstring(pid) + L")";
     }
     ui::Success(L"Target: " + targetDesc);
+
+    // The injector is 32-bit: refuse clearly instead of failing silently.
+    {
+        std::wstring bitReason;
+        if (!CheckTargetBitness(pid, bitReason)) {
+            return Fail(opt, bitReason);
+        }
+    }
 
     // DLL path (explicit --dll or auto-located next to Injector.exe)
     std::wstring dllPath = opt.dllPath.empty() ? GetDefaultDllPath() : opt.dllPath;
@@ -1008,13 +1152,29 @@ int wmain(int argc, wchar_t** argv) {
     ui::StepOk();
 
     WaitForSingleObject(hThread, INFINITE);
+    DWORD threadExit = 0;
+    GetExitCodeThread(hThread, &threadExit);
     CloseHandle(hThread);
 
     // Cleanup
     VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
+
+    // Verify truthfully: the thread exit code is the HMODULE returned by
+    // LoadLibraryW, and the module must show up in the target's module list.
+    std::wstring dllFile = DllFileName(dllPath);
+    if (threadExit == 0) {
+        CloseHandle(hProcess);
+        return Fail(opt, L"LoadLibraryW returned NULL in the target process. "
+                         L"The DLL failed to load (often a 32/64-bit mismatch or a missing dependency).");
+    }
+    if (!ModulePresentInProcess(pid, dllFile)) {
+        CloseHandle(hProcess);
+        return Fail(opt, L"Remote thread finished but " + dllFile +
+                         L" was not found in the target's modules. Injection did not take effect.");
+    }
     CloseHandle(hProcess);
 
-    ui::Success(L"DLL injected successfully!");
+    ui::Success(L"DLL injected successfully and verified in target modules!");
     WaitForExitKey(opt);
     return 0;
 }

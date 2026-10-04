@@ -3,6 +3,7 @@
 #include <tlhelp32.h>
 #include <detours.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string>
 #include <winnt.h>
 
@@ -14,9 +15,39 @@
 // hardcoded. Optional advanced hooks are loaded from FocusCheat.ini
 // located next to this DLL (see FocusCheat.example.ini).
 
+// Append-only diagnostics log next to this DLL.
+static void Log(const char* fmt, ...) {
+    char dllPath[MAX_PATH] = {};
+    GetModuleFileNameA(GetModuleHandleA("FocusCheat.dll"), dllPath, MAX_PATH);
+    std::string p(dllPath);
+    size_t pos = p.find_last_of("\\/");
+    std::string dir = (pos == std::string::npos) ? ".\\" : p.substr(0, pos + 1);
+    std::string logPath = dir + "FocusCheat.log";
+
+    FILE* f = NULL;
+    if (fopen_s(&f, logPath.c_str(), "a") != 0 || !f) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "[%02d:%02d:%02d.%03d][pid %lu] ",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            (unsigned long)GetCurrentProcessId());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
 // ---------- Global variables ----------
 static HHOOK g_hMsgHooks[64];
 static int g_nMsgHooks = 0;
+static DWORD g_hookedTids[256];
+static int g_nHookedTids = 0;
+static HANDLE g_hWatchThread = NULL;
+static volatile BOOL g_bWatching = FALSE;
+static BOOL g_attachedCustomA = FALSE;
+static BOOL g_attachedCustomB = FALSE;
 
 // Original API pointers (for restoration)
 HWND(WINAPI* TrueGetForegroundWindow)(void) = GetForegroundWindow;
@@ -203,47 +234,186 @@ static void GetDllDirectory(wchar_t* outDir, DWORD cch) {
     wcsncpy_s(outDir, cch, dir.c_str(), _TRUNCATE);
 }
 
-static void InstallCustomHooks() {
+struct CustomConfig {
+    wchar_t moduleName[256];
+    char sigA[256];
+    char sigB[256];
+    bool hasModule;
+};
+
+static void ReadCustomConfig(CustomConfig& cfg) {
+    memset(&cfg, 0, sizeof(cfg));
     wchar_t dir[MAX_PATH];
     GetDllDirectory(dir, MAX_PATH);
     wchar_t iniPath[MAX_PATH];
     _snwprintf_s(iniPath, MAX_PATH, _TRUNCATE, L"%sFocusCheat.ini", dir);
 
-    wchar_t moduleName[256] = {};
-    wchar_t sigA[256] = {};
-    wchar_t sigB[256] = {};
-    GetPrivateProfileString(L"CustomHooks", L"Module", L"", moduleName, 256, iniPath);
-    GetPrivateProfileString(L"CustomHooks", L"Signature1", L"", sigA, 256, iniPath);
-    GetPrivateProfileString(L"CustomHooks", L"Signature2", L"", sigB, 256, iniPath);
+    wchar_t sigAW[256] = {};
+    wchar_t sigBW[256] = {};
+    GetPrivateProfileString(L"CustomHooks", L"Module", L"", cfg.moduleName, 256, iniPath);
+    GetPrivateProfileString(L"CustomHooks", L"Signature1", L"", sigAW, 256, iniPath);
+    GetPrivateProfileString(L"CustomHooks", L"Signature2", L"", sigBW, 256, iniPath);
+    WideCharToMultiByte(CP_UTF8, 0, sigAW, -1, cfg.sigA, 256, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, sigBW, -1, cfg.sigB, 256, NULL, NULL);
+    cfg.hasModule = (cfg.moduleName[0] != 0);
+}
 
-    if (!moduleName[0]) return;
+static bool ConfigHasModule() {
+    CustomConfig cfg;
+    ReadCustomConfig(cfg);
+    return cfg.hasModule;
+}
 
-    HMODULE hMod = GetModuleHandle(moduleName);
-    if (!hMod) return;
+static bool IsTidHooked(DWORD tid) {
+    for (int i = 0; i < g_nHookedTids; i++) {
+        if (g_hookedTids[i] == tid) return true;
+    }
+    return false;
+}
 
-    char sigA8[256] = {};
-    char sigB8[256] = {};
-    WideCharToMultiByte(CP_UTF8, 0, sigA, -1, sigA8, 256, NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, sigB, -1, sigB8, 256, NULL, NULL);
+// Hooks message handling on all not-yet-hooked threads of this process.
+// Returns the number of newly hooked threads.
+static int HookNewThreads() {
+    int added = 0;
+    DWORD selfPid = GetCurrentProcessId();
+    HMODULE hSelf = GetModuleHandle(L"FocusCheat.dll");
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        Log("thread snapshot failed err=%lu", GetLastError());
+        return 0;
+    }
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != selfPid) continue;
+            if (IsTidHooked(te.th32ThreadID)) continue;
+            if (g_nMsgHooks >= 64 || g_nHookedTids >= 256) break;
+            HHOOK h = SetWindowsHookEx(WH_GETMESSAGE, GetMsgProc, hSelf, te.th32ThreadID);
+            if (h) {
+                g_hMsgHooks[g_nMsgHooks++] = h;
+                g_hookedTids[g_nHookedTids++] = te.th32ThreadID;
+                added++;
+            }
+            else {
+                Log("SetWindowsHookEx tid %lu failed err=%lu",
+                    (unsigned long)te.th32ThreadID, GetLastError());
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return added;
+}
 
-    if (sigA8[0]) {
-        PVOID p = FindModuleFuncByMarker(hMod, sigA8);
+// Resolves not-yet-resolved custom targets. No Detours calls here, so it is
+// safe to call outside a transaction. Returns true if anything new resolved.
+static bool ResolveCustomTargets(const CustomConfig& cfg) {
+    if (!cfg.hasModule) return false;
+    HMODULE hMod = GetModuleHandle(cfg.moduleName);
+    if (!hMod) return false;
+    bool fresh = false;
+    if (!TrueCustomHookA && cfg.sigA[0]) {
+        PVOID p = FindModuleFuncByMarker(hMod, cfg.sigA);
         if (p) {
             TrueCustomHookA = (CustomNoop_t)p;
-            DetourAttach(&(PVOID&)TrueCustomHookA, FakeCustomHookA);
+            fresh = true;
+            Log("custom A resolved at %p", p);
+        }
+        else {
+            Log("custom A: marker not found in module");
         }
     }
-    if (sigB8[0]) {
-        PVOID p = FindModuleFuncByMarker(hMod, sigB8);
+    if (!TrueCustomHookB && cfg.sigB[0]) {
+        PVOID p = FindModuleFuncByMarker(hMod, cfg.sigB);
         if (p) {
             TrueCustomHookB = (CustomNoop_t)p;
-            DetourAttach(&(PVOID&)TrueCustomHookB, FakeCustomHookB);
+            fresh = true;
+            Log("custom B resolved at %p", p);
+        }
+        else {
+            Log("custom B: marker not found in module");
         }
     }
+    return fresh;
+}
+
+// Attaches resolved-but-unattached custom hooks. Caller must hold an
+// active Detours transaction.
+static void AttachResolvedCustom() {
+    if (TrueCustomHookA && !g_attachedCustomA) {
+        LONG err = DetourAttach(&(PVOID&)TrueCustomHookA, FakeCustomHookA);
+        Log("attach custom A err=%ld", err);
+        if (err == NO_ERROR) g_attachedCustomA = TRUE;
+    }
+    if (TrueCustomHookB && !g_attachedCustomB) {
+        LONG err = DetourAttach(&(PVOID&)TrueCustomHookB, FakeCustomHookB);
+        Log("attach custom B err=%ld", err);
+        if (err == NO_ERROR) g_attachedCustomB = TRUE;
+    }
+}
+
+static void InstallCustomHooks() {
+    CustomConfig cfg;
+    ReadCustomConfig(cfg);
+    if (!cfg.hasModule) {
+        Log("custom hooks: no Module configured, skipped");
+        return;
+    }
+    Log("custom hooks: module=%S", cfg.moduleName);
+    if (!GetModuleHandle(cfg.moduleName)) {
+        Log("custom hooks: module not loaded yet, watcher will retry");
+        return;
+    }
+    if (ResolveCustomTargets(cfg)) {
+        AttachResolvedCustom();
+    }
+    else {
+        Log("custom hooks: nothing new to attach");
+    }
+}
+
+// Background watcher: picks up late module loads and late-created threads.
+static DWORD WINAPI WatchThreadProc(LPVOID) {
+    Log("watcher start");
+    for (int i = 0; i < 30 && g_bWatching; i++) {
+        // Sleep in small chunks so RemoveHooks never waits out a full cycle.
+        for (int s = 0; s < 10 && g_bWatching; s++) {
+            Sleep(200);
+        }
+        if (!g_bWatching) break;
+        int added = HookNewThreads();
+        if (added > 0) {
+            Log("watcher hooked %d new thread(s)", added);
+        }
+        CustomConfig cfg;
+        ReadCustomConfig(cfg);
+        if (!cfg.hasModule) break;
+        if (!GetModuleHandle(cfg.moduleName)) continue;
+        bool fresh = ResolveCustomTargets(cfg);
+        bool pending = (TrueCustomHookA && !g_attachedCustomA) ||
+                       (TrueCustomHookB && !g_attachedCustomB);
+        if (fresh || pending) {
+            DetourTransactionBegin();
+            DetourUpdateThread(GetCurrentThread());
+            AttachResolvedCustom();
+            LONG err = DetourTransactionCommit();
+            Log("watcher custom transaction commit err=%ld", err);
+        }
+    }
+    Log("watcher exit");
+    return 0;
 }
 
 // ---------- Uninstall all hooks ----------
 void RemoveHooks() {
+    Log("RemoveHooks begin");
+    g_bWatching = FALSE;
+    if (g_hWatchThread) {
+        WaitForSingleObject(g_hWatchThread, 3000);
+        CloseHandle(g_hWatchThread);
+        g_hWatchThread = NULL;
+    }
+
     for (int i = 0; i < g_nMsgHooks; i++) {
         if (g_hMsgHooks[i]) {
             UnhookWindowsHookEx(g_hMsgHooks[i]);
@@ -251,57 +421,74 @@ void RemoveHooks() {
         }
     }
     g_nMsgHooks = 0;
+    g_nHookedTids = 0;
 
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
-    DetourDetach(&(PVOID&)TrueGetForegroundWindow, FakeGetForegroundWindow);
-    DetourDetach(&(PVOID&)TrueSetWindowDisplayAffinity, FakeSetWindowDisplayAffinity);
-    if (TrueCustomHookA) {
-        DetourDetach(&(PVOID&)TrueCustomHookA, FakeCustomHookA);
+    LONG eFg = DetourDetach(&(PVOID&)TrueGetForegroundWindow, FakeGetForegroundWindow);
+    LONG eAf = DetourDetach(&(PVOID&)TrueSetWindowDisplayAffinity, FakeSetWindowDisplayAffinity);
+    LONG eA = NO_ERROR, eB = NO_ERROR;
+    if (g_attachedCustomA) {
+        eA = DetourDetach(&(PVOID&)TrueCustomHookA, FakeCustomHookA);
+        g_attachedCustomA = FALSE;
     }
-    if (TrueCustomHookB) {
-        DetourDetach(&(PVOID&)TrueCustomHookB, FakeCustomHookB);
+    if (g_attachedCustomB) {
+        eB = DetourDetach(&(PVOID&)TrueCustomHookB, FakeCustomHookB);
+        g_attachedCustomB = FALSE;
     }
-    DetourTransactionCommit();
+    TrueCustomHookA = NULL;
+    TrueCustomHookB = NULL;
+    LONG eC = DetourTransactionCommit();
+    Log("detach fg=%ld affinity=%ld customA=%ld customB=%ld commit=%ld",
+        eFg, eAf, eA, eB, eC);
 }
 
 // ---------- Install all hooks ----------
 BOOL InstallHooks() {
-    HMODULE hSelf = GetModuleHandle(L"FocusCheat.dll");
+    Log("InstallHooks begin");
 
-    // 1. Install message hooks on all threads of this process (best effort).
-    DWORD selfPid = GetCurrentProcessId();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
-        THREADENTRY32 te;
-        te.dwSize = sizeof(te);
-        if (Thread32First(snap, &te)) {
-            do {
-                if (te.th32OwnerProcessID == selfPid && g_nMsgHooks < (int)(sizeof(g_hMsgHooks) / sizeof(g_hMsgHooks[0]))) {
-                    HHOOK h = SetWindowsHookEx(WH_GETMESSAGE, GetMsgProc, hSelf, te.th32ThreadID);
-                    if (h) g_hMsgHooks[g_nMsgHooks++] = h;
-                }
-            } while (Thread32Next(snap, &te));
-        }
-        CloseHandle(snap);
-    }
+    // 1. Install message hooks on all current threads (best effort).
+    int hooked = HookNewThreads();
+    Log("message hooks installed on %d thread(s)", hooked);
 
     // 2. Allow capture on our own main window if present.
     HWND hOwn = GetOwnMainWindow();
     if (hOwn) {
         SetWindowDisplayAffinity(hOwn, WDA_NONE);
+        Log("cleared display affinity on own main window %p", (void*)hOwn);
+    }
+    else {
+        Log("no own main window found yet");
     }
 
     // 3. Install API hooks via Detours.
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
-    DetourAttach(&(PVOID&)TrueGetForegroundWindow, FakeGetForegroundWindow);
-    DetourAttach(&(PVOID&)TrueSetWindowDisplayAffinity, FakeSetWindowDisplayAffinity);
+    LONG errFg = DetourAttach(&(PVOID&)TrueGetForegroundWindow, FakeGetForegroundWindow);
+    LONG errAf = DetourAttach(&(PVOID&)TrueSetWindowDisplayAffinity, FakeSetWindowDisplayAffinity);
+    Log("attach GetForegroundWindow err=%ld, SetWindowDisplayAffinity err=%ld", errFg, errAf);
 
     // 4. Optional custom hooks from FocusCheat.ini (skipped if absent).
     InstallCustomHooks();
 
-    DetourTransactionCommit();
+    LONG errCommit = DetourTransactionCommit();
+    Log("detour transaction commit err=%ld", errCommit);
+
+    // 5. Watch for late module loads + late-created threads (if configured).
+    if (ConfigHasModule()) {
+        g_bWatching = TRUE;
+        g_hWatchThread = CreateThread(NULL, 0, WatchThreadProc, NULL, 0, NULL);
+        if (g_hWatchThread) {
+            Log("watcher thread started");
+        }
+        else {
+            g_bWatching = FALSE;
+            Log("watcher thread create failed err=%lu", GetLastError());
+        }
+    }
+    else {
+        Log("watcher disabled (no Module configured)");
+    }
 
     return TRUE;
 }
