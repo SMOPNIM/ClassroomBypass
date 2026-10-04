@@ -282,6 +282,10 @@ struct CustomConfig {
     wchar_t moduleName[256];
     char sigA[256];
     char sigB[256];
+    wchar_t funcARva[32];
+    wchar_t funcBRva[32];
+    char funcAFp[65];
+    char funcBFp[65];
     bool hasModule;
 };
 
@@ -299,6 +303,14 @@ static void ReadCustomConfig(CustomConfig& cfg) {
     GetPrivateProfileString(L"CustomHooks", L"Signature2", L"", sigBW, 256, iniPath);
     WideCharToMultiByte(CP_UTF8, 0, sigAW, -1, cfg.sigA, 256, NULL, NULL);
     WideCharToMultiByte(CP_UTF8, 0, sigBW, -1, cfg.sigB, 256, NULL, NULL);
+    wchar_t fpAW[65] = {};
+    wchar_t fpBW[65] = {};
+    GetPrivateProfileString(L"CustomHooks", L"FuncA_RVA", L"", cfg.funcARva, 32, iniPath);
+    GetPrivateProfileString(L"CustomHooks", L"FuncB_RVA", L"", cfg.funcBRva, 32, iniPath);
+    GetPrivateProfileString(L"CustomHooks", L"FuncA_FP", L"", fpAW, 65, iniPath);
+    GetPrivateProfileString(L"CustomHooks", L"FuncB_FP", L"", fpBW, 65, iniPath);
+    WideCharToMultiByte(CP_UTF8, 0, fpAW, -1, cfg.funcAFp, 65, NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, fpBW, -1, cfg.funcBFp, 65, NULL, NULL);
     cfg.hasModule = (cfg.moduleName[0] != 0);
 }
 
@@ -409,9 +421,154 @@ static void LogScanDiag(const char* tag, DWORD strRva) {
     Log("diag %s: modBase=%p textSize=0x%X strRva=0x%X strVa=0x%08X rawHits=%d",
         tag, (void*)g_pModuleBase, g_dwTextSize, strRva, strVa, hits);
     for (int k = 0; k < hits && k < 8; k++) {
-        Log("diag %s: hit#%d at text+0x%X leadByte=%02X",
-            tag, k, hitOff[k], g_pTextBase[hitOff[k]]);
+        // Dump 8 bytes before and after the hit: identifies the real opcode.
+        DWORD ctxBase = hitOff[k] >= 8 ? hitOff[k] - 8 : 0;
+        char hex[49] = {};
+        for (int b = 0; b < 16; b++) {
+            if (ctxBase + (DWORD)b >= g_dwTextSize) break;
+            unsigned v = g_pTextBase[ctxBase + b];
+            hex[b * 3] = "0123456789ABCDEF"[(v >> 4) & 0xF];
+            hex[b * 3 + 1] = "0123456789ABCDEF"[v & 0xF];
+            hex[b * 3 + 2] = ' ';
+        }
+        Log("diag %s: hit#%d at text+0x%X ctx[%08X]=%s", tag, k, hitOff[k],
+            (unsigned)(ctxBase + 0x1000), hex);
     }
+}
+
+// Relocation-aware fingerprint check: bytes covered by a HIGHLOW reloc
+// entry legitimately differ (preferred base vs loaded base), so they are
+// skipped during comparison. Returns true on match.
+static bool VerifyFingerprint(HMODULE hMod, DWORD rva, const BYTE* fp, int fpLen) {
+    BYTE* base = (BYTE*)hMod;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    DWORD relocAddr = 0, relocSize = 0;
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        char name[9] = {};
+        memcpy(name, sections[i].Name, 8);
+        if (strcmp(name, ".reloc") == 0) {
+            relocAddr = sections[i].VirtualAddress;
+            relocSize = sections[i].Misc.VirtualSize;
+            break;
+        }
+    }
+    // Collect HIGHLOW reloc RVAs that overlap [rva, rva+fpLen).
+    DWORD hits[64];
+    int nHits = 0;
+    if (relocAddr && relocSize) {
+        DWORD end = relocAddr + relocSize;
+        for (DWORD blk = relocAddr; blk + 8 <= end && nHits < 64; ) {
+            DWORD page = *(DWORD*)(base + blk);
+            DWORD blkSize = *(DWORD*)(base + blk + 4);
+            if (blkSize < 8) break;
+            for (DWORD o = 8; o + 2 <= blkSize && nHits < 64; o += 2) {
+                WORD e = *(WORD*)(base + blk + o);
+                if ((e >> 12) == 3) { // IMAGE_REL_BASED_HIGHLOW
+                    DWORD rr = page + (e & 0x0FFF);
+                    if (rr + 4 > rva && rr < rva + (DWORD)fpLen) {
+                        hits[nHits++] = rr;
+                    }
+                }
+            }
+            blk += blkSize;
+        }
+    }
+    for (int i = 0; i < fpLen; i++) {
+        bool relocated = false;
+        for (int k = 0; k < nHits; k++) {
+            if ((DWORD)i + rva >= hits[k] && (DWORD)i + rva < hits[k] + 4) {
+                relocated = true;
+                break;
+            }
+        }
+        if (!relocated && base[rva + i] != fp[i]) return false;
+    }
+    return true;
+}
+static bool TryResolvePinned(HMODULE hMod, const wchar_t* rvaStr, const char* fpHex,
+                             const char* sig, CustomNoop_t& trueFn, char label) {
+    if (trueFn) return false; // already resolved
+    if (!rvaStr[0]) return false; // not configured
+    wchar_t* end = NULL;
+    unsigned long rva = wcstoul(rvaStr, &end, 16);
+    if (end == rvaStr || rva == 0) {
+        Log("custom %c: bad RVA value", label);
+        return false;
+    }
+    BYTE fp[32];
+    int fpLen = 0;
+    for (const char* p = fpHex; p[0] && p[1] && fpLen < 32; p += 2) {
+        int hi = (p[0] >= '0' && p[0] <= '9') ? p[0] - '0'
+               : ((p[0] >= 'A' && p[0] <= 'F') ? p[0] - 'A' + 10
+               : ((p[0] >= 'a' && p[0] <= 'f') ? p[0] - 'a' + 10 : -1));
+        int lo = (p[1] >= '0' && p[1] <= '9') ? p[1] - '0'
+               : ((p[1] >= 'A' && p[1] <= 'F') ? p[1] - 'A' + 10
+               : ((p[1] >= 'a' && p[1] <= 'f') ? p[1] - 'a' + 10 : -1));
+        if (hi < 0 || lo < 0) break;
+        fp[fpLen++] = (BYTE)(hi * 16 + lo);
+    }
+    if (fpLen < 8) {
+        Log("custom %c: fingerprint too short (need >=8 hex chars)", label);
+        return false;
+    }
+    if (!InitPESections(hMod)) {
+        Log("custom %c: PE parse failed", label);
+        return false;
+    }
+    BYTE* base = (BYTE*)hMod;
+    if (!InitPESections(hMod)) {
+        Log("custom %c: PE parse failed", label);
+        return false;
+    }
+    DWORD textRva = (DWORD)(g_pTextBase - base);
+    if (rva < textRva || rva + (DWORD)fpLen > textRva + g_dwTextSize) {
+        Log("custom %c: RVA 0x%X outside .text, refused", label, rva);
+        return false;
+    }
+    if (!VerifyFingerprint(hMod, rva, fp, fpLen)) {
+        char actual[65] = {};
+        for (int b = 0; b < fpLen && b < 32; b++) {
+            unsigned v = *(base + rva + b);
+            actual[b * 2] = "0123456789ABCDEF"[(v >> 4) & 0xF];
+            actual[b * 2 + 1] = "0123456789ABCDEF"[v & 0xF];
+        }
+        Log("custom %c: fingerprint mismatch at RVA 0x%X, refused (module updated?)",
+            label, rva);
+        Log("custom %c: actual bytes: %s", label, actual);
+        return false;
+    }
+    trueFn = (CustomNoop_t)(base + rva);
+    Log("custom %c pinned at %p (fingerprint ok)", label, (void*)trueFn);
+    // Consistency check: the marker string must be referenced within the
+    // first 0x400 bytes (matches the analyzed layout). Refuse otherwise.
+    if (sig[0] && InitPESections(hMod)) {
+        DWORD strRva = FindStringInRdataFrom(sig, 0);
+        bool consistent = false;
+        if (strRva) {
+            DWORD strVa = (DWORD)base + strRva;
+            for (DWORD i = 0; i + 5 < 0x400; i++) {
+                BYTE op = *(base + rva + i);
+                if (op == 0x68 || (op >= 0xB8 && op <= 0xBF)) {
+                    DWORD imm = *(DWORD*)(base + rva + i + 1);
+                    if (imm == strVa) {
+                        consistent = true;
+                        Log("custom %c: marker ref found +0x%X inside, consistent", label, i);
+                        break;
+                    }
+                }
+            }
+        }
+        if (!consistent) {
+            Log("custom %c: pinned target does not reference the marker, refused", label);
+            trueFn = NULL;
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool ResolveCustomTargets(const CustomConfig& cfg) {
@@ -424,34 +581,54 @@ static bool ResolveCustomTargets(const CustomConfig& cfg) {
     }
     if (!g_diagDone && (!TrueCustomHookA || !TrueCustomHookB)) {
         g_diagDone = TRUE;
-        DWORD rA = FindStringInRdataFrom(cfg.sigA, 0);
-        if (rA) LogScanDiag("A", rA);
-        DWORD rB = FindStringInRdataFrom(cfg.sigB, 0);
-        if (rB) LogScanDiag("B", rB);
+        // NOTE: sections must be initialized before scanning (FindString*
+        // helpers rely on globals set by InitPESections).
+        if (InitPESections(hMod)) {
+            DWORD rA = FindStringInRdataFrom(cfg.sigA, 0);
+            if (rA) LogScanDiag("A", rA);
+            DWORD rB = FindStringInRdataFrom(cfg.sigB, 0);
+            if (rB) LogScanDiag("B", rB);
+        }
     }
     bool fresh = false;
-    if (!TrueCustomHookA && cfg.sigA[0]) {
-        int stage = 0;
-        PVOID p = FindModuleFuncByMarker(hMod, cfg.sigA, &stage);
-        if (p) {
-            TrueCustomHookA = (CustomNoop_t)p;
-            fresh = true;
-            Log("custom A resolved at %p", p);
+    if (!TrueCustomHookA) {
+        // Pinned RVA wins when configured; otherwise fall back to the
+        // string heuristic (works for framed functions).
+        if (cfg.funcARva[0]) {
+            if (TryResolvePinned(hMod, cfg.funcARva, cfg.funcAFp, cfg.sigA, TrueCustomHookA, 'A')) {
+                fresh = true;
+            }
         }
-        else {
-            Log("custom A: locate failed at stage %d (1=no string, 2=no code ref)", stage);
+        else if (cfg.sigA[0]) {
+            int stage = 0;
+            PVOID p = FindModuleFuncByMarker(hMod, cfg.sigA, &stage);
+            if (p) {
+                TrueCustomHookA = (CustomNoop_t)p;
+                fresh = true;
+                Log("custom A resolved at %p", p);
+            }
+            else {
+                Log("custom A: locate failed at stage %d (1=no string, 2=no code ref)", stage);
+            }
         }
     }
-    if (!TrueCustomHookB && cfg.sigB[0]) {
-        int stage = 0;
-        PVOID p = FindModuleFuncByMarker(hMod, cfg.sigB, &stage);
-        if (p) {
-            TrueCustomHookB = (CustomNoop_t)p;
-            fresh = true;
-            Log("custom B resolved at %p", p);
+    if (!TrueCustomHookB) {
+        if (cfg.funcBRva[0]) {
+            if (TryResolvePinned(hMod, cfg.funcBRva, cfg.funcBFp, cfg.sigB, TrueCustomHookB, 'B')) {
+                fresh = true;
+            }
         }
-        else {
-            Log("custom B: locate failed at stage %d (1=no string, 2=no code ref)", stage);
+        else if (cfg.sigB[0]) {
+            int stage = 0;
+            PVOID p = FindModuleFuncByMarker(hMod, cfg.sigB, &stage);
+            if (p) {
+                TrueCustomHookB = (CustomNoop_t)p;
+                fresh = true;
+                Log("custom B resolved at %p", p);
+            }
+            else {
+                Log("custom B: locate failed at stage %d (1=no string, 2=no code ref)", stage);
+            }
         }
     }
     return fresh;
