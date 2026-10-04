@@ -23,9 +23,9 @@
    - 创建远程线程调用 `LoadLibraryW`，将 DLL 加载进目标进程。
 
 2. **焦点欺骗 (`FocusCheat.dll`)**
-   - **消息钩子**：拦截本进程窗口的 `WM_KILLFOCUS` / `WM_ACTIVATE` 等失焦消息，直接丢弃。
+   - **消息钩子（best-effort）**：`WH_GETMESSAGE` 只能看到进队列的消息，直接 `SendMessage` 发出的失焦通知走不到这里；彻底拦截需要窗口子类化（未实现）。
    - **API 钩子 (Detours)**：
-     - `GetForegroundWindow` → 返回本进程主窗口句柄。
+     - `GetForegroundWindow` → 返回本进程主窗口句柄（带缓存）。
      - `SetWindowDisplayAffinity` → 对本进程窗口返回“成功”但不实际施加限制，同时注入时清除已有保护属性。
    - **可选自定义钩子**：如需研究特定模块内部通知函数，可在 DLL 同目录放置 `FocusCheat.ini`（参考 `FocusCheat.example.ini`），填写你自有程序的模块名与特征字符串；缺省则跳过。
 
@@ -63,7 +63,7 @@ cd Detours\src
 nmake /nologo
 ```
 
-编译完成后会在 `Detours\lib.X86\` 生成 `detours.lib`，`Detours\include\` 生成头文件。
+编译完成后会在 `Detours\lib.X86\` 生成 `detours.lib`，`Detours\include\` 生成头文件。这些是 nmake 本地生成物（被 submodule 的 `.gitignore` 忽略），全新克隆后需要重新执行这一步。
 
 ### 3. 编译项目
 
@@ -75,16 +75,16 @@ msbuild FocusCheat\FocusCheat.vcxproj /p:Configuration=Debug /p:Platform=Win32 /
 msbuild Injector\Injector.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:PlatformToolset=v143 /p:SolutionDir="%CD%\\" /nologo /verbosity:minimal
 ```
 
-编译产物在 `Debug\` 目录下：`Injector.exe` 和 `FocusCheat.dll`。
+编译产物在 `Debug\` 目录下：`Injector.exe` 和 `FocusCheat.dll`（输出目录由 `SolutionDir` 决定；不要被各项目下的残留 `Debug`/`Release` 中间目录迷惑，以此次命令为准）。
 
 > **注意**：
-> - 必须选择 **x86** 平台（目标进程为 32 位）。
-> - 若使用 VS 2022 完整版，`PlatformToolset` 改为 `v145`。
+> - 必须选择 **x86** 平台（目标与 DLL 均为 32 位）。
+> - 工程文件里写的是 `v145` 工具集；只有 BuildTools（`v143`）的环境才需要加 `/p:PlatformToolset=v143` 覆盖。用 VS 2022 完整版时去掉该参数即可（即用文件自带的 `v145`）。
 > - Release 编译将 `Debug` 替换为 `Release` 即可。
 
 ### 也可通过 Visual Studio 编译
 
-用 VS 打开 `ClassroomBypass.slnx`，选择 **x86** 平台，按 `Ctrl+Shift+B` 生成。
+用 VS 打开 `ClassroomBypass.slnx`，**手动选择 x86 平台后再**按 `Ctrl+Shift+B` 生成（`.slnx` 里 x64 排在前面，VS 默认选中的是 x64，必须切到 x86）。
 
 ---
 
@@ -102,6 +102,7 @@ msbuild Injector\Injector.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:Pl
    Injector.exe --process <进程映像名>
    ```
    完整选项见 `Injector.exe --help`（`--color`、`--quiet`、`--yes`、`--page-size`、`--verify` 等）。
+   `--list` 输出是给脚本解析的纯文本（只有 PID 和进程名）；Arch / Window 两列只在交互式选择器里显示。
    同名多进程时看 **Arch 列选 x86**（注入器是 32 位，选 64 位会被明确拒绝），再看 **Window 列**确认是主程序窗口所在的进程。注完可用 `Injector.exe --verify <PID或进程名>` 复查 DLL 是否真的在目标模块表里。
 5. 控制台输出 `DLL injected successfully and verified in target modules!` 即表示成功（附带模块表校验，不是只等线程结束）。
 6. （可选）如需启用自定义钩子，将 `FocusCheat.example.ini` 复制为 `FocusCheat.ini` 并按注释填写你自有程序的值。

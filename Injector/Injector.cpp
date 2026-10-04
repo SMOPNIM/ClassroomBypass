@@ -283,22 +283,80 @@ static BOOL CALLBACK EnumMainWindowProc(HWND hWnd, LPARAM lParam) {
     DWORD pid = 0;
     GetWindowThreadProcessId(hWnd, &pid);
     if (pid == 0 || titles->find(pid) != titles->end()) return TRUE;
-    wchar_t text[256];
-    if (GetWindowText(hWnd, text, 256) > 0) {
+    wchar_t text[1024];
+    if (GetWindowText(hWnd, text, 1024) > 0) {
         (*titles)[pid] = text;
     }
     return TRUE;
 }
 
-static bool QueryWow64(HANDLE hProcess, bool& wow64) {
+enum class Arch {
+    Unknown,
+    X86,
+    X64,
+    ARM64,
+};
+
+static Arch MachineToArch(USHORT machine) {
+    switch (machine) {
+    case IMAGE_FILE_MACHINE_I386: return Arch::X86;
+    case IMAGE_FILE_MACHINE_AMD64: return Arch::X64;
+    case IMAGE_FILE_MACHINE_ARM64: return Arch::ARM64;
+    default: return Arch::Unknown;
+    }
+}
+
+// Preferred: IsWow64Process2 distinguishes x64/ARM64; falls back to
+// IsWow64Process on older systems.
+static Arch GetProcessArch(HANDLE hProcess) {
+    typedef BOOL(WINAPI * IsWow64Process2Fn)(HANDLE, USHORT*, USHORT*);
+    static IsWow64Process2Fn fn2 = (IsWow64Process2Fn)GetProcAddress(
+        GetModuleHandle(L"kernel32.dll"), "IsWow64Process2");
+    if (fn2) {
+        USHORT processMachine = 0, nativeMachine = 0;
+        if (fn2(hProcess, &processMachine, &nativeMachine)) {
+            if (processMachine == IMAGE_FILE_MACHINE_UNKNOWN) {
+                return MachineToArch(nativeMachine);
+            }
+            return MachineToArch(processMachine);
+        }
+        return Arch::Unknown;
+    }
     typedef BOOL(WINAPI * IsWow64ProcessFn)(HANDLE, PBOOL);
     static IsWow64ProcessFn fn = (IsWow64ProcessFn)GetProcAddress(
         GetModuleHandle(L"kernel32.dll"), "IsWow64Process");
-    if (!fn) return false;
-    BOOL b = FALSE;
-    if (!fn(hProcess, &b)) return false;
-    wow64 = (b != FALSE);
-    return true;
+    if (!fn) return Arch::Unknown;
+    BOOL wow = FALSE;
+    if (!fn(hProcess, &wow)) return Arch::Unknown;
+    return wow ? Arch::X86 : Arch::X64;
+}
+
+static std::wstring ArchName(Arch arch) {
+    switch (arch) {
+    case Arch::X86: return L"x86";
+    case Arch::X64: return L"x64";
+    case Arch::ARM64: return L"ARM64";
+    default: return L"?";
+    }
+}
+
+// Reads the PE Machine field of a DLL/EXE on disk.
+static Arch DllArch(const std::wstring& dllPath) {
+    HANDLE hFile = CreateFile(dllPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return Arch::Unknown;
+    BYTE head[4096];
+    DWORD read = 0;
+    BOOL ok = ReadFile(hFile, head, sizeof(head), &read, NULL);
+    CloseHandle(hFile);
+    if (!ok || read < sizeof(IMAGE_DOS_HEADER)) return Arch::Unknown;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)head;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return Arch::Unknown;
+    DWORD peOff = (DWORD)dos->e_lfanew;
+    if (peOff + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) > read) return Arch::Unknown;
+    if (*(DWORD*)(head + peOff) != IMAGE_NT_SIGNATURE) return Arch::Unknown;
+    IMAGE_FILE_HEADER* fh = (IMAGE_FILE_HEADER*)(head + peOff + sizeof(DWORD));
+    return MachineToArch(fh->Machine);
 }
 
 static void FillProcessDetails(std::vector<ProcessEntry>& entries) {
@@ -310,10 +368,7 @@ static void FillProcessDetails(std::vector<ProcessEntry>& entries) {
 
         HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, e.pid);
         if (h) {
-            bool wow = false;
-            if (QueryWow64(h, wow)) {
-                e.arch = wow ? L"x86" : L"x64";
-            }
+            e.arch = ArchName(GetProcessArch(h));
             CloseHandle(h);
         }
     }
@@ -324,16 +379,16 @@ static std::vector<ProcessEntry> ListAllProcesses() {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return out;
 
-    PROCESSENTRY32 pe;
+    PROCESSENTRY32W pe;
     pe.dwSize = sizeof(pe);
-    if (Process32First(snap, &pe)) {
+    if (Process32FirstW(snap, &pe)) {
         do {
             ProcessEntry e;
             e.pid = pe.th32ProcessID;
             e.name = pe.szExeFile;
             e.arch = L"?";
             out.push_back(e);
-        } while (Process32Next(snap, &pe));
+        } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
 
@@ -350,14 +405,14 @@ static std::vector<DWORD> FindPidsByName(const std::wstring& name) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return pids;
 
-    PROCESSENTRY32 pe;
+    PROCESSENTRY32W pe;
     pe.dwSize = sizeof(pe);
-    if (Process32First(snap, &pe)) {
+    if (Process32FirstW(snap, &pe)) {
         do {
             if (_wcsicmp(pe.szExeFile, name.c_str()) == 0) {
                 pids.push_back(pe.th32ProcessID);
             }
-        } while (Process32Next(snap, &pe));
+        } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
     return pids;
@@ -377,20 +432,34 @@ static std::wstring ProcessNameByPid(const std::vector<ProcessEntry>& all, DWORD
     return L"";
 }
 
-// The injector is 32-bit, so the target must be 32-bit as well.
-// Returns true when compatible (or undeterminable); false with a reason otherwise.
-static bool CheckTargetBitness(DWORD pid, std::wstring& reason) {
-    bool selfWow = false, targetWow = false;
-    if (!QueryWow64(GetCurrentProcess(), selfWow)) return true;
+// Central selection invariant: selected is always a valid view index.
+// Call before any rows[view[selected]] use instead of relying on every
+// mutation path to maintain it.
+static void ClampSelection(const std::vector<size_t>& view, size_t& selected) {
+    if (view.empty()) selected = 0;
+    else if (selected >= view.size()) selected = view.size() - 1;
+}
+
+// Both the injector and the DLL are 32-bit, so the target must be 32-bit
+// and the DLL must be a 32-bit image as well. Returns true when compatible
+// (or undeterminable); false with a reason otherwise.
+static std::wstring DllFileName(const std::wstring& dllPath);
+static bool CheckTargetBitness(DWORD pid, const std::wstring& dllPath, std::wstring& reason) {
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!h) return true; // let the later OpenProcess report the real error
-    bool ok = QueryWow64(h, targetWow);
+    Arch target = GetProcessArch(h);
     CloseHandle(h);
-    if (!ok) return true;
-    if (selfWow != targetWow) {
-        // This injector is always built 32-bit, so a mismatch means a 64-bit target.
-        reason = L"Bitness mismatch: this injector is 32-bit but the target process is 64-bit. "
+    if (target == Arch::Unknown) return true;
+    if (target != Arch::X86) {
+        reason = L"Target process is " + ArchName(target) +
+                 L" but this injector only handles 32-bit (x86) targets. " +
                  L"Pick the 32-bit instance (see the Arch column).";
+        return false;
+    }
+    Arch dll = DllArch(dllPath);
+    if (dll != Arch::Unknown && dll != Arch::X86) {
+        reason = L"The DLL is not 32-bit (" + DllFileName(dllPath) + L" reports " +
+                 ArchName(dll) + L"). Rebuild it for x86.";
         return false;
     }
     return true;
@@ -754,6 +823,7 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
             break;
         }
         if (ch == 13) { // Enter: confirm highlight (noop on empty view)
+            ClampSelection(view, selected);
             if (!view.empty()) {
                 finalPid = rows[view[selected]].pid;
                 break;
@@ -998,10 +1068,13 @@ int wmain(int argc, wchar_t** argv) {
     ui::Init(opt);
 
     if (opt.listOnly) {
+        // Plain pid+name format is intentional: machine-readable for scripts.
+        // Arch/Window columns are only in the interactive picker.
         std::vector<ProcessEntry> procs = ListAllProcesses();
         for (const auto& e : procs) {
             std::wcout << e.pid << L"  " << e.name << L"\n";
         }
+        WaitForExitKey(opt);
         return 0;
     }
 
@@ -1016,6 +1089,7 @@ int wmain(int argc, wchar_t** argv) {
             targets = FindPidsByName(opt.verifyTarget);
             if (targets.empty()) {
                 ui::Error(L"Process not found: " + opt.verifyTarget);
+                WaitForExitKey(opt);
                 return 1;
             }
         }
@@ -1030,8 +1104,18 @@ int wmain(int argc, wchar_t** argv) {
             else {
                 swprintf_s(buf, L"PID %lu: %s is NOT loaded.", (unsigned long)vpid, dllFile.c_str());
                 ui::Warn(buf);
+                HANDLE hv = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, vpid);
+                if (hv) {
+                    Arch va = GetProcessArch(hv);
+                    CloseHandle(hv);
+                    if (va == Arch::X64 || va == Arch::ARM64) {
+                        ui::Info(L"  Note: PID " + std::to_wstring(vpid) + L" is " + ArchName(va) +
+                                 L"; a 32-bit DLL can never load there. This is expected, not an injection failure.");
+                    }
+                }
             }
         }
+        WaitForExitKey(opt);
         return anyFound ? 0 : 1;
     }
 
@@ -1070,20 +1154,20 @@ int wmain(int argc, wchar_t** argv) {
     }
     ui::Success(L"Target: " + targetDesc);
 
-    // The injector is 32-bit: refuse clearly instead of failing silently.
-    {
-        std::wstring bitReason;
-        if (!CheckTargetBitness(pid, bitReason)) {
-            return Fail(opt, bitReason);
-        }
-    }
-
     // DLL path (explicit --dll or auto-located next to Injector.exe)
     std::wstring dllPath = opt.dllPath.empty() ? GetDefaultDllPath() : opt.dllPath;
     if (GetFileAttributes(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         return Fail(opt, L"DLL not found: " + dllPath);
     }
     ui::Info(L"DLL: " + dllPath);
+
+    // Bitness: refuse clearly instead of failing silently.
+    {
+        std::wstring bitReason;
+        if (!CheckTargetBitness(pid, dllPath, bitReason)) {
+            return Fail(opt, bitReason);
+        }
+    }
 
     // Confirmation (interactive only, unless --yes).
     if (interactive && !opt.assumeYes) {
