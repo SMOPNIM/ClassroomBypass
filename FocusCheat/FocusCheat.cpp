@@ -8,6 +8,7 @@
 #include <winnt.h>
 
 #pragma comment(lib, "detours.lib")
+#pragma comment(lib, "version.lib")
 
 // Generic foreground / display-affinity research module.
 // It only affects windows owned by the process it is injected into.
@@ -102,13 +103,33 @@ static BOOL InitPESections(HMODULE hModule) {
     return (g_pTextBase && g_pRdataBase);
 }
 
-static DWORD FindStringInRdata(const char* keyword) {
+static DWORD FindStringInRdataFrom(const char* keyword, DWORD start) {
     size_t kwLen = strlen(keyword);
     if (!g_pRdataBase || kwLen == 0 || g_dwRdataSize < kwLen) return 0;
-    for (DWORD i = 0; i + (DWORD)kwLen <= g_dwRdataSize; i++) {
+    if (start >= g_dwRdataSize) return 0;
+    for (DWORD i = start; i + (DWORD)kwLen <= g_dwRdataSize; i++) {
         if (memcmp(g_pRdataBase + i, keyword, kwLen) == 0) {
             return (DWORD)(g_pRdataBase - g_pModuleBase) + i;
         }
+    }
+    return 0;
+}
+
+// UTF-16LE (wide) variant, e.g. CefString event names.
+static DWORD FindWideStringInRdataFrom(const char* keyword, DWORD start) {
+    size_t kwLen = strlen(keyword);
+    if (!g_pRdataBase || kwLen == 0 || kwLen > 120) return 0;
+    if (start >= g_dwRdataSize) return 0;
+    for (DWORD i = start; i + (DWORD)kwLen * 2 <= g_dwRdataSize; i++) {
+        bool ok = true;
+        for (size_t k = 0; k < kwLen; k++) {
+            if (g_pRdataBase[i + k * 2] != (BYTE)keyword[k] ||
+                g_pRdataBase[i + k * 2 + 1] != 0) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return (DWORD)(g_pRdataBase - g_pModuleBase) + i;
     }
     return 0;
 }
@@ -149,13 +170,33 @@ static PVOID FindModuleFuncByMarker(HMODULE hModule, const char* marker, int* pF
     if (!hModule || !marker || !marker[0]) return NULL;
     if (!InitPESections(hModule)) { if (pFailStage) *pFailStage = 1; return NULL; }
 
-    DWORD strRva = FindStringInRdata(marker);
-    if (!strRva) { if (pFailStage) *pFailStage = 1; return NULL; }
+    DWORD rdataRva = (DWORD)(g_pRdataBase - g_pModuleBase);
+    bool anyString = false;
 
-    DWORD funcOffset = FindFuncByStringRef(strRva);
-    if (!funcOffset) { if (pFailStage) *pFailStage = 2; return NULL; }
+    // Pass 1: try every narrow occurrence (code may reference a later copy).
+    for (DWORD off = 0; ; ) {
+        DWORD strRva = FindStringInRdataFrom(marker, off);
+        if (!strRva) break;
+        anyString = true;
+        DWORD funcOffset = FindFuncByStringRef(strRva);
+        if (funcOffset) return (PVOID)(g_pTextBase + funcOffset);
+        off = strRva - rdataRva + 1;
+    }
+    // Pass 2: UTF-16LE occurrences.
+    for (DWORD off = 0; ; ) {
+        DWORD strRva = FindWideStringInRdataFrom(marker, off);
+        if (!strRva) break;
+        anyString = true;
+        DWORD funcOffset = FindFuncByStringRef(strRva);
+        if (funcOffset) {
+            Log("marker matched wide string");
+            return (PVOID)(g_pTextBase + funcOffset);
+        }
+        off = strRva - rdataRva + 2;
+    }
 
-    return (PVOID)(g_pTextBase + funcOffset);
+    if (pFailStage) *pFailStage = anyString ? 2 : 1;
+    return NULL;
 }
 
 // ---------- Own-process window helpers ----------
@@ -318,10 +359,40 @@ static int HookNewThreads() {
 
 // Resolves not-yet-resolved custom targets. No Detours calls here, so it is
 // safe to call outside a transaction. Returns true if anything new resolved.
+static HMODULE g_versionLoggedFor = NULL;
+
+static void LogModuleVersion(HMODULE hMod) {
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileName(hMod, path, MAX_PATH);
+    Log("custom module path=%S", path);
+    DWORD handle = 0;
+    DWORD verSize = GetFileVersionInfoSize(path, &handle);
+    if (!verSize || verSize > 65536) {
+        Log("custom module has no version resource");
+        return;
+    }
+    BYTE* buf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, verSize);
+    if (!buf) return;
+    if (GetFileVersionInfo(path, handle, verSize, buf)) {
+        VS_FIXEDFILEINFO* info = NULL;
+        UINT infoLen = 0;
+        if (VerQueryValue(buf, L"\\", (LPVOID*)&info, &infoLen) && info) {
+            Log("custom module version %u.%u.%u.%u",
+                (unsigned)HIWORD(info->dwFileVersionMS), (unsigned)LOWORD(info->dwFileVersionMS),
+                (unsigned)HIWORD(info->dwFileVersionLS), (unsigned)LOWORD(info->dwFileVersionLS));
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, buf);
+}
+
 static bool ResolveCustomTargets(const CustomConfig& cfg) {
     if (!cfg.hasModule) return false;
     HMODULE hMod = GetModuleHandle(cfg.moduleName);
     if (!hMod) return false;
+    if (hMod != g_versionLoggedFor) {
+        LogModuleVersion(hMod);
+        g_versionLoggedFor = hMod;
+    }
     bool fresh = false;
     if (!TrueCustomHookA && cfg.sigA[0]) {
         int stage = 0;
@@ -452,6 +523,7 @@ void RemoveHooks() {
     }
     TrueCustomHookA = NULL;
     TrueCustomHookB = NULL;
+    g_versionLoggedFor = NULL;
     LONG eC = DetourTransactionCommit();
     Log("detach fg=%ld affinity=%ld customA=%ld customB=%ld commit=%ld",
         eFg, eAf, eA, eB, eC);
