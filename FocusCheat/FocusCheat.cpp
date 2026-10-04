@@ -360,6 +360,7 @@ static int HookNewThreads() {
 // Resolves not-yet-resolved custom targets. No Detours calls here, so it is
 // safe to call outside a transaction. Returns true if anything new resolved.
 static HMODULE g_versionLoggedFor = NULL;
+static BOOL g_diagDone = FALSE;
 
 static void LogModuleVersion(HMODULE hMod) {
     wchar_t path[MAX_PATH] = {};
@@ -385,6 +386,34 @@ static void LogModuleVersion(HMODULE hMod) {
     HeapFree(GetProcessHeap(), 0, buf);
 }
 
+// Temporary diagnostic: count raw occurrences of the packed string VA in
+// .text (opcode-agnostic) and log module geometry. Tells apart "bytes not
+// in memory" from "seen but not recognized".
+static void LogScanDiag(const char* tag, DWORD strRva) {
+    DWORD strVa = (DWORD)g_pModuleBase + strRva;
+    BYTE pat[4];
+    pat[0] = (BYTE)(strVa & 0xFF);
+    pat[1] = (BYTE)((strVa >> 8) & 0xFF);
+    pat[2] = (BYTE)((strVa >> 16) & 0xFF);
+    pat[3] = (BYTE)((strVa >> 24) & 0xFF);
+    DWORD hitOff[8] = {};
+    int hits = 0;
+    if (g_pTextBase && g_dwTextSize > 4) {
+        for (DWORD i = 0; i + 4 <= g_dwTextSize; i++) {
+            if (memcmp(g_pTextBase + i, pat, 4) == 0) {
+                if (hits < 8) hitOff[hits] = i;
+                hits++;
+            }
+        }
+    }
+    Log("diag %s: modBase=%p textSize=0x%X strRva=0x%X strVa=0x%08X rawHits=%d",
+        tag, (void*)g_pModuleBase, g_dwTextSize, strRva, strVa, hits);
+    for (int k = 0; k < hits && k < 8; k++) {
+        Log("diag %s: hit#%d at text+0x%X leadByte=%02X",
+            tag, k, hitOff[k], g_pTextBase[hitOff[k]]);
+    }
+}
+
 static bool ResolveCustomTargets(const CustomConfig& cfg) {
     if (!cfg.hasModule) return false;
     HMODULE hMod = GetModuleHandle(cfg.moduleName);
@@ -392,6 +421,13 @@ static bool ResolveCustomTargets(const CustomConfig& cfg) {
     if (hMod != g_versionLoggedFor) {
         LogModuleVersion(hMod);
         g_versionLoggedFor = hMod;
+    }
+    if (!g_diagDone && (!TrueCustomHookA || !TrueCustomHookB)) {
+        g_diagDone = TRUE;
+        DWORD rA = FindStringInRdataFrom(cfg.sigA, 0);
+        if (rA) LogScanDiag("A", rA);
+        DWORD rB = FindStringInRdataFrom(cfg.sigB, 0);
+        if (rB) LogScanDiag("B", rB);
     }
     bool fresh = false;
     if (!TrueCustomHookA && cfg.sigA[0]) {
@@ -524,6 +560,7 @@ void RemoveHooks() {
     TrueCustomHookA = NULL;
     TrueCustomHookB = NULL;
     g_versionLoggedFor = NULL;
+    g_diagDone = FALSE;
     LONG eC = DetourTransactionCommit();
     Log("detach fg=%ld affinity=%ld customA=%ld customB=%ld commit=%ld",
         eFg, eAf, eA, eB, eC);
