@@ -69,7 +69,6 @@ static BYTE* g_pTextBase = NULL;
 static DWORD g_dwTextSize = 0;
 static BYTE* g_pRdataBase = NULL;
 static DWORD g_dwRdataSize = 0;
-static DWORD g_dwImageBase = 0;
 
 static DWORD FindFuncStart(DWORD textOffset);
 
@@ -82,7 +81,6 @@ static BOOL InitPESections(HMODULE hModule) {
     if (nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
 
     g_pModuleBase = base;
-    g_dwImageBase = nt->OptionalHeader.ImageBase;
     g_pTextBase = NULL;
     g_pRdataBase = NULL;
 
@@ -126,7 +124,9 @@ static DWORD FindFuncStart(DWORD textOffset) {
 }
 
 static DWORD FindFuncByStringRef(DWORD strRva) {
-    DWORD strVa = g_dwImageBase + strRva;
+    // NOTE: compare against the ACTUAL loaded base, not the PE header's
+    // preferred ImageBase (ASLR relocates the module at load time).
+    DWORD strVa = (DWORD)g_pModuleBase + strRva;
     for (DWORD i = 0; i + 5 < g_dwTextSize; i++) {
         // PUSH imm32
         if (g_pTextBase[i] == 0x68) {
@@ -144,15 +144,16 @@ static DWORD FindFuncByStringRef(DWORD strRva) {
     return 0;
 }
 
-static PVOID FindModuleFuncByMarker(HMODULE hModule, const char* marker) {
+static PVOID FindModuleFuncByMarker(HMODULE hModule, const char* marker, int* pFailStage) {
+    if (pFailStage) *pFailStage = 0;
     if (!hModule || !marker || !marker[0]) return NULL;
-    if (!InitPESections(hModule)) return NULL;
+    if (!InitPESections(hModule)) { if (pFailStage) *pFailStage = 1; return NULL; }
 
     DWORD strRva = FindStringInRdata(marker);
-    if (!strRva) return NULL;
+    if (!strRva) { if (pFailStage) *pFailStage = 1; return NULL; }
 
     DWORD funcOffset = FindFuncByStringRef(strRva);
-    if (!funcOffset) return NULL;
+    if (!funcOffset) { if (pFailStage) *pFailStage = 2; return NULL; }
 
     return (PVOID)(g_pTextBase + funcOffset);
 }
@@ -323,25 +324,27 @@ static bool ResolveCustomTargets(const CustomConfig& cfg) {
     if (!hMod) return false;
     bool fresh = false;
     if (!TrueCustomHookA && cfg.sigA[0]) {
-        PVOID p = FindModuleFuncByMarker(hMod, cfg.sigA);
+        int stage = 0;
+        PVOID p = FindModuleFuncByMarker(hMod, cfg.sigA, &stage);
         if (p) {
             TrueCustomHookA = (CustomNoop_t)p;
             fresh = true;
             Log("custom A resolved at %p", p);
         }
         else {
-            Log("custom A: marker not found in module");
+            Log("custom A: locate failed at stage %d (1=no string, 2=no code ref)", stage);
         }
     }
     if (!TrueCustomHookB && cfg.sigB[0]) {
-        PVOID p = FindModuleFuncByMarker(hMod, cfg.sigB);
+        int stage = 0;
+        PVOID p = FindModuleFuncByMarker(hMod, cfg.sigB, &stage);
         if (p) {
             TrueCustomHookB = (CustomNoop_t)p;
             fresh = true;
             Log("custom B resolved at %p", p);
         }
         else {
-            Log("custom B: marker not found in module");
+            Log("custom B: locate failed at stage %d (1=no string, 2=no code ref)", stage);
         }
     }
     return fresh;
