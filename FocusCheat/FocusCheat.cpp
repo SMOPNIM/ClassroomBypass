@@ -44,6 +44,8 @@ static HHOOK g_hMsgHooks[64];
 static int g_nMsgHooks = 0;
 static DWORD g_hookedTids[256];
 static int g_nHookedTids = 0;
+static DWORD g_failedTids[64];
+static int g_nFailedTids = 0;
 static HANDLE g_hWatchThread = NULL;
 static volatile BOOL g_bWatching = FALSE;
 static BOOL g_attachedCustomA = FALSE;
@@ -296,8 +298,16 @@ static int HookNewThreads() {
                 added++;
             }
             else {
-                Log("SetWindowsHookEx tid %lu failed err=%lu",
-                    (unsigned long)te.th32ThreadID, GetLastError());
+                // Log each failing tid only once to keep the log readable.
+                bool logged = false;
+                for (int k = 0; k < g_nFailedTids; k++) {
+                    if (g_failedTids[k] == te.th32ThreadID) { logged = true; break; }
+                }
+                if (!logged) {
+                    Log("SetWindowsHookEx tid %lu failed err=%lu (best effort, skipped)",
+                        (unsigned long)te.th32ThreadID, GetLastError());
+                    if (g_nFailedTids < 64) g_failedTids[g_nFailedTids++] = te.th32ThreadID;
+                }
             }
         } while (Thread32Next(snap, &te));
     }
@@ -422,6 +432,7 @@ void RemoveHooks() {
     }
     g_nMsgHooks = 0;
     g_nHookedTids = 0;
+    g_nFailedTids = 0;
 
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
