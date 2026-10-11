@@ -202,12 +202,12 @@ static void PrintUsage() {
                << L"\n"
                << L"Interface:\n"
                << L"  --color=auto|always|never   Color output (default: auto = TTY only)\n"
-               << L"  --quiet, -q            Suppress banner and hints\n"
+               << L"  --quiet, -q            Suppress banner, hints, and the exit pause\n"
                << L"  --yes, -y              Skip confirmation prompt\n"
                << L"  --page-size <N>        Rows per page in the picker (default: 20)\n"
                << L"  --help, -h             Show this help\n"
                << L"\n"
-               << L"Interactive picker: type to filter (name or PID), Up/Down = move,\n"
+               << L"Interactive picker: type to filter (name or PID), Up/Down = move, Home/End,\n"
                << L"  PgUp/PgDn = page, / = clear filter, Enter = confirm, Esc/Ctrl+C = cancel.\n"
                << L"\n"
                << L"Examples:\n"
@@ -251,9 +251,31 @@ static int CellWidth(wchar_t c) {
     return 1;
 }
 
+// Returns the code point at s[i] and advances i past it (handles
+// surrogate pairs so callers never split one).
+static unsigned int NextCodePoint(const std::wstring& s, size_t& i) {
+    wchar_t hi = s[i++];
+    if (hi >= 0xD800 && hi <= 0xDBFF && i < s.size()) {
+        wchar_t lo = s[i];
+        if (lo >= 0xDC00 && lo <= 0xDFFF) {
+            ++i;
+            return 0x10000u + (((unsigned int)hi - 0xD800u) << 10) + ((unsigned int)lo - 0xDC00u);
+        }
+    }
+    return (unsigned int)hi;
+}
+
+// Display width of one code point. Non-BMP (emoji etc.) counts as wide.
+static int CodePointWidth(unsigned int cp) {
+    if (cp > 0xFFFF) return 2;
+    return CellWidth((wchar_t)cp);
+}
+
 static int DisplayWidth(const std::wstring& s) {
     int w = 0;
-    for (wchar_t c : s) w += CellWidth(c);
+    for (size_t i = 0; i < s.size();) {
+        w += CodePointWidth(NextCodePoint(s, i));
+    }
     return w;
 }
 
@@ -548,8 +570,8 @@ static std::vector<FrameLine> BuildFrame(const std::vector<ProcessEntry>& rows,
         emit(L"Filter: " + filter, defAttr);
     }
 
-    emit(L"  #     PID       Arch  Image Name              Window Title", defAttr);
-    emit(L"  --    --------  ----  ------------------------  ------------------------------", defAttr);
+    emit(L"  #     PID       Arch   Image Name              Window Title", defAttr);
+    emit(L"  --    --------  -----  ------------------------  ------------------------------", defAttr);
 
     const size_t nameWidth = 24;
     const size_t titleWidth = 30;
@@ -557,10 +579,12 @@ static std::vector<FrameLine> BuildFrame(const std::vector<ProcessEntry>& rows,
         if (DisplayWidth(src) <= (int)width) return src;
         std::wstring cut;
         int w = 0;
-        for (wchar_t c : src) {
-            int cw = CellWidth(c);
+        for (size_t i = 0; i < src.size();) {
+            size_t start = i;
+            unsigned int cp = NextCodePoint(src, i);
+            int cw = CodePointWidth(cp);
             if (w + cw > (int)width - 1) break;
-            cut += c;
+            cut.append(src, start, i - start);
             w += cw;
         }
         return cut + L"…";
@@ -568,7 +592,7 @@ static std::vector<FrameLine> BuildFrame(const std::vector<ProcessEntry>& rows,
     for (size_t i = page * pageSize; i < view.size() && i < (page + 1) * pageSize; ++i) {
         const ProcessEntry& e = rows[view[i]];
         wchar_t row[160];
-        swprintf_s(row, L"%c %-4llu  %-8lu  %-4s  ", (i == selected ? L'>' : L' '),
+        swprintf_s(row, L"%c %-4llu  %-8lu  %-5s  ", (i == selected ? L'>' : L' '),
                    (unsigned long long)(i + 1), (unsigned long)e.pid,
                    e.arch.c_str());
         std::wstring line(row);
@@ -578,7 +602,7 @@ static std::vector<FrameLine> BuildFrame(const std::vector<ProcessEntry>& rows,
         emit(line, (i == selected) ? yellow : defAttr);
     }
 
-    emit(L"Type=filter Up/Down=move PgUp/PgDn=page Enter=OK Esc=cancel", dim);
+    emit(L"Type=filter Up/Down=move Home/End PgUp/PgDn=/-clear Enter=OK Esc/Ctrl+C=cancel", dim);
     return lines;
 }
 
@@ -605,11 +629,15 @@ static int BlitFrame(const std::vector<FrameLine>& in, HANDLE hCon, WORD defAttr
     }
     for (int r = 0; r < frameH && r < totalH; ++r) {
         int col = 0;
-        for (wchar_t c : in[r].text) {
-            int cw = CellWidth(c);
+        for (size_t i = 0; i < in[r].text.size();) {
+            size_t start = i;
+            unsigned int cp = NextCodePoint(in[r].text, i);
+            int cw = CodePointWidth(cp);
             if (col + cw > width) break;
             size_t idx = (size_t)r * (size_t)width + (size_t)col;
-            cells[idx].Char.UnicodeChar = c;
+            // CHAR_INFO holds a single UTF-16 unit: non-BMP characters
+            // cannot be represented, so emit a visible placeholder.
+            cells[idx].Char.UnicodeChar = (cp > 0xFFFF) ? L'?' : (wchar_t)cp;
             cells[idx].Attributes = in[r].attr;
             if (cw == 2 && col + 1 < width) {
                 cells[idx + 1].Attributes = in[r].attr;
@@ -745,7 +773,21 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
         CONSOLE_SCREEN_BUFFER_INFO abi;
         if (GetConsoleScreenBufferInfo(hCon, &abi)) {
             defAttr = abi.wAttributes;
-            topRow = abi.dwCursorPosition.Y;
+            int anchor = (int)abi.dwCursorPosition.Y;
+            int need = (int)pageSize + 6; // header + filter + column lines + rows + footer
+            if (anchor + need > (int)abi.dwSize.Y) {
+                // Not enough rows below the cursor (long output above);
+                // scrolling blank lines frees the bottom of the buffer,
+                // and the frame anchors there instead of being clipped.
+                std::wstring blanks((size_t)need, L'\n');
+                DWORD written = 0;
+                WriteConsoleW(hCon, blanks.c_str(), (DWORD)blanks.size(), &written, NULL);
+                if (GetConsoleScreenBufferInfo(hCon, &abi)) {
+                    anchor = (int)abi.dwSize.Y - need;
+                }
+            }
+            if (anchor < 0) anchor = 0;
+            topRow = (SHORT)anchor;
         }
     }
     int prevRows = 0;
@@ -900,10 +942,12 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
             continue;
         }
         if (ch >= 32 && ch <= 126) { // Printable ASCII: live filter
-            filter += (wchar_t)ch;
-            view = ApplyFilter(rows, filter);
-            selected = 0;
-            needRender = true;
+            if (ch != 32) { // space never appears in image names/PIDs; ignore it
+                filter += (wchar_t)ch;
+                view = ApplyFilter(rows, filter);
+                selected = 0;
+                needRender = true;
+            }
             continue;
         }
         // Ignore other keys (no redraw).
@@ -929,13 +973,25 @@ static DWORD ResolveNameToPid(const std::wstring& name, const Options& opt) {
         return 0;
     }
     std::vector<ProcessEntry> all = ListAllProcesses();
+    // Reuse the fully-populated rows (Arch + Window Title included - the
+    // two columns the user needs to tell same-named processes apart).
     std::vector<ProcessEntry> cands;
-    for (DWORD pid : pids) {
-        ProcessEntry e;
-        e.pid = pid;
-        e.name = ProcessNameByPid(all, pid);
-        if (e.name.empty()) e.name = name;
-        cands.push_back(e);
+    for (const auto& e : all) {
+        for (DWORD pid : pids) {
+            if (e.pid == pid) {
+                cands.push_back(e);
+                break;
+            }
+        }
+    }
+    // PIDs can vanish between the two snapshots; fall back to name-only rows.
+    if (cands.empty()) {
+        for (DWORD pid : pids) {
+            ProcessEntry e;
+            e.pid = pid;
+            e.name = name;
+            cands.push_back(e);
+        }
     }
     ui::Info(L"Multiple matches; pick one:");
     return picker::Run(cands, L"", opt.pageSize);
@@ -1070,9 +1126,10 @@ static bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
     return true;
 }
 
-// Press-any-key pause, interactive consoles only.
+// Press-any-key pause, interactive consoles only. --yes and --quiet both
+// mean "non-interactive use", so neither should ever block on a key.
 static void WaitForExitKey(const Options& opt) {
-    if (opt.assumeYes) return;
+    if (opt.assumeYes || opt.quiet) return;
     if (!ui::StdinIsConsole()) return;
     ui::Dim(L"Press any key to exit...");
     _getch();
@@ -1169,7 +1226,9 @@ int wmain(int argc, wchar_t** argv) {
         }
         pid = PromptForTarget(opt);
         if (pid == 0) {
-            return Fail(opt, L"No valid target selected.");
+            // Picker/FallbackPick already reported why (cancel or error).
+            WaitForExitKey(opt);
+            return 1;
         }
         if (!ProcessExists(pid)) {
             return Fail(opt, L"Process not found (PID " + std::to_wstring(pid) + L").");
@@ -1202,6 +1261,7 @@ int wmain(int argc, wchar_t** argv) {
         answer = ToLower(Trim(answer));
         if (!answer.empty() && answer != L"y" && answer != L"yes") {
             ui::Warn(L"Cancelled.");
+            WaitForExitKey(opt);
             return 1;
         }
     }
@@ -1260,7 +1320,21 @@ int wmain(int argc, wchar_t** argv) {
     }
     ui::StepOk();
 
-    WaitForSingleObject(hThread, INFINITE);
+    // The remote thread runs LoadLibraryW under the target's loader lock,
+    // which can take a while if the target is busy loading something else.
+    // Never block forever without telling the user.
+    const DWORD kLoadTimeoutMs = 30000;
+    if (WaitForSingleObject(hThread, kLoadTimeoutMs) == WAIT_TIMEOUT) {
+        // Deliberately leak hThread and the remote path buffer: the remote
+        // thread may still be reading it, and freeing early would crash the
+        // target. The thread finishes on its own; check with --verify later.
+        CloseHandle(hProcess);
+        ui::Warn(L"LoadLibraryW still running in the target after 30s (loader busy). "
+                 L"Injection may still complete; re-check with: Injector.exe --verify " +
+                 std::to_wstring(pid));
+        WaitForExitKey(opt);
+        return 1;
+    }
     DWORD threadExit = 0;
     GetExitCodeThread(hThread, &threadExit);
     CloseHandle(hThread);
