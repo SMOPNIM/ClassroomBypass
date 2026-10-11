@@ -704,6 +704,27 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
         ~CursorGuard() { ui::ShowCursor(); }
     } cursorGuard;
 
+    // Disable QuickEdit for the session: a stray click in the console
+    // window otherwise enters selection mode, which blocks all input to
+    // _getch() and looks exactly like a hard freeze. Esc/Enter would
+    // unstick it, but users reasonably expect the TUI to keep working.
+    // Restored verbatim on exit (destructor runs on every exit path).
+    struct QuickEditGuard {
+        HANDLE hIn;
+        DWORD origMode;
+        bool changed;
+        QuickEditGuard()
+            : hIn(GetStdHandle(STD_INPUT_HANDLE)), origMode(0), changed(false) {
+            if (GetConsoleMode(hIn, &origMode)) {
+                DWORD m = (origMode | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE;
+                changed = SetConsoleMode(hIn, m) != FALSE;
+            }
+        }
+        ~QuickEditGuard() {
+            if (changed) SetConsoleMode(hIn, origMode);
+        }
+    } quickEditGuard;
+
     // Swallow Ctrl+C during the picker so it cancels instead of killing.
     // (Ctrl+Break keeps its default terminate behavior.)
     struct CtrlGuard {
@@ -807,6 +828,10 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
         }
 
         int ch = _getch();
+        if (ch < 0) { // EOF / broken console: cancel instead of spinning
+            finalPid = 0;
+            break;
+        }
         if (ch == 3) { // Ctrl+C delivered as a key: cancel
             finalPid = 0;
             break;
