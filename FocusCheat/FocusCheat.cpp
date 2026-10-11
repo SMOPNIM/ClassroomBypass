@@ -1,5 +1,6 @@
 #include "FocusCheat.h"
 #include <windows.h>
+#include <commctrl.h>
 #include <tlhelp32.h>
 #include <detours.h>
 #include <stdio.h>
@@ -11,6 +12,7 @@
 
 #pragma comment(lib, "detours.lib")
 #pragma comment(lib, "version.lib")
+#pragma comment(lib, "comctl32.lib")
 
 // Generic foreground / display-affinity research module.
 // It only affects windows owned by the process it is injected into.
@@ -270,11 +272,15 @@ static HWND GetCachedMainWindow() {
 }
 
 // ---------- 1. Message hook: intercept focus-loss messages ----------
-// NOTE: WH_GETMESSAGE only observes queued (posted) messages. Focus-loss
-// notifications delivered via SendMessage bypass this hook entirely;
-// intercepting those requires window subclassing (planned separately),
-// so this layer is best-effort only.
+static void UpdateSubclass(); // see 1b below
+// WH_GETMESSAGE only observes queued (posted) messages. Focus-loss
+// notifications delivered via SendMessage bypass this hook; the window
+// subclass below (section 1b) covers that path. Together the two layers
+// are best-effort but cover both delivery mechanisms for the main window.
 LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam) {
+    // Runs on the pumping thread's context, i.e. the window's own UI
+    // thread - the correct place to (re)subclass. Cheap: throttled inside.
+    UpdateSubclass();
     if (code == HC_ACTION) {
         MSG* pMsg = (MSG*)lParam;
         if (IsOwnWindow(pMsg->hwnd)) {
@@ -286,6 +292,74 @@ LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam) {
         }
     }
     return CallNextHookEx(NULL, code, wParam, lParam);
+}
+
+// ---------- 1b. Window subclass: catch SendMessage-delivered focus loss ----------
+// The queued-message filter above cannot see messages sent directly to the
+// window procedure. A comctl32 subclass of the main window drops the sent
+// variants before the app's own proc runs.
+// Scope: the main window only. Focus-loss messages addressed to child
+// controls are not filtered (apps rarely gate on those; GetForegroundWindow
+// is spoofed for polling code). WM_NCACTIVATE is not filtered either:
+// swallowing it would keep the frame drawn "active" while DWM/OS state
+// disagrees, risking visual tearing; app pause logic keys off
+// KILLFOCUS/ACTIVATE/ACTIVATEAPP, which we do drop.
+static std::atomic<HWND> g_subclassedWnd{ NULL };
+static ULONGLONG g_lastSubclassTryTick = 0;
+
+static LRESULT CALLBACK FocusLossSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                              LPARAM lParam, UINT_PTR uId,
+                                              DWORD_PTR dwRef) {
+    if (msg == WM_KILLFOCUS) {
+        return 0; // pretend the app never saw it
+    }
+    if (msg == WM_ACTIVATE && LOWORD(wParam) == WA_INACTIVE) {
+        return 0;
+    }
+    if (msg == WM_ACTIVATEAPP && wParam == FALSE) {
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+// (Re)subclass the current main window. Idempotent, throttled to 1s.
+// Called from GetMsgProc (runs on the window's own thread - preferred)
+// and from the watcher as a fallback when the UI thread is not pumping
+// yet. Cross-thread SetWindowSubclass is best-effort: it is an atomic
+// WNDPROC swap; the worst case is one racing dispatch, and the window
+// only outlives the swap in ways the app already tolerates.
+static void UpdateSubclass() {
+    ULONGLONG now = GetTickCount64();
+    if (g_lastSubclassTryTick && now - g_lastSubclassTryTick < 1000) return;
+    g_lastSubclassTryTick = now;
+
+    HWND prev = g_subclassedWnd.load();
+    if (prev && !IsWindow(prev)) {
+        g_subclassedWnd.store(NULL); // window died; subclass record died with it
+        prev = NULL;
+    }
+    HWND h = GetOwnMainWindow();
+    if (!h || h == prev) return;
+
+    if (SetWindowSubclass(h, FocusLossSubclassProc, 1, 0)) {
+        HWND old = g_subclassedWnd.exchange(h);
+        if (old && old != h && IsWindow(old)) {
+            RemoveWindowSubclass(old, FocusLossSubclassProc, 1);
+        }
+        Log("subclassed main window %p (sent focus-loss messages now filtered)", (void*)h);
+    }
+    else {
+        Log("SetWindowSubclass(%p) failed err=%lu", (void*)h, GetLastError());
+    }
+}
+
+static void RemoveSubclass() {
+    HWND sw = g_subclassedWnd.exchange(NULL);
+    if (sw && IsWindow(sw)) {
+        // Best-effort: runs during detach; the UI thread may be mid-dispatch.
+        // Acceptable - detach here happens at process teardown in practice.
+        RemoveWindowSubclass(sw, FocusLossSubclassProc, 1);
+    }
 }
 
 // ---------- 2. Fake GetForegroundWindow (spoof foreground ownership) ----------
@@ -765,6 +839,7 @@ static DWORD WINAPI WatchThreadProc(LPVOID) {
         if (hOwn) {
             SetWindowDisplayAffinity(hOwn, WDA_NONE);
             Log("cleared display affinity on own main window %p", (void*)hOwn);
+            UpdateSubclass();
         }
         else {
             Log("no own main window found yet");
@@ -782,6 +857,7 @@ static DWORD WINAPI WatchThreadProc(LPVOID) {
         if (added > 0) {
             Log("watcher hooked %d new thread(s)", added);
         }
+        UpdateSubclass(); // fallback in case GetMsgProc hasn't run yet
         TryAttachCustomOnce(false);
     }
     Log("watcher exit");
@@ -806,6 +882,8 @@ void RemoveHooks() {
     g_nMsgHooks = 0;
     g_nHookedTids = 0;
     g_nFailedTids = 0;
+
+    RemoveSubclass();
 
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());

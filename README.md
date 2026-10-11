@@ -23,7 +23,7 @@
    - 创建远程线程调用 `LoadLibraryW`，将 DLL 加载进目标进程。
 
 2. **焦点欺骗 (`FocusCheat.dll`)**
-   - **消息钩子（best-effort）**：`WH_GETMESSAGE` 只能看到进队列的消息，直接 `SendMessage` 发出的失焦通知走不到这里；彻底拦截需要窗口子类化（未实现）。
+   - **消息过滤（两层）**：`WH_GETMESSAGE` 过滤进队列的失焦消息；主窗口再做 comctl32 子类化，丢弃直接 `SendMessage` 投递的 `WM_KILLFOCUS` / `WM_ACTIVATE(WA_INACTIVE)` / `WM_ACTIVATEAPP(FALSE)`。两层均为 best-effort，仅覆盖主窗口（子控件与 `WM_NCACTIVATE` 不动）。
    - **API 钩子 (Detours)**：
      - `GetForegroundWindow` → 返回本进程主窗口句柄（带缓存）。
      - `SetWindowDisplayAffinity` → 对本进程窗口返回“成功”但不实际施加限制，同时注入时清除已有保护属性。
