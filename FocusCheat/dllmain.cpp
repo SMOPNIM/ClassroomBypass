@@ -13,7 +13,7 @@ BOOL APIENTRY DllMain(HMODULE hModule,
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         // FALSE refuses the load; the injector surfaces it via LoadLibrary NULL.
-        return InstallHooks();
+        return InstallHooks(hModule);
     case DLL_PROCESS_DETACH:
         RemoveHooks();
         break;

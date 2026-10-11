@@ -23,6 +23,12 @@
 static CRITICAL_SECTION g_logCs;
 static CRITICAL_SECTION g_scanCs;
 
+// Our own module handle, captured in InstallHooks (passed from DllMain).
+// Everything that used to hardcode the module name "FocusCheat.dll"
+// (log path, ini path, hook module) uses this, so renaming the DLL
+// keeps working.
+static HMODULE g_hSelf = NULL;
+
 // RAII guard for the scan lock. Lock order is always scan -> log
 // (Log never takes the scan lock), so no inversion is possible.
 struct ScanLock {
@@ -36,7 +42,7 @@ struct ScanLock {
 static void Log(const char* fmt, ...) {
     EnterCriticalSection(&g_logCs);
     char dllPath[MAX_PATH] = {};
-    GetModuleFileNameA(GetModuleHandleA("FocusCheat.dll"), dllPath, MAX_PATH);
+    if (g_hSelf) GetModuleFileNameA(g_hSelf, dllPath, MAX_PATH);
     char dir[MAX_PATH] = ".\\";
     char* sep = strrchr(dllPath, '\\');
     char* slash = strrchr(dllPath, '/');
@@ -78,6 +84,9 @@ static HANDLE g_hWatchThread = NULL;
 static std::atomic<BOOL> g_watching{ FALSE };
 static BOOL g_attachedCustomA = FALSE;
 static BOOL g_attachedCustomB = FALSE;
+// Set once nothing is left to attach (or nothing was configured). The
+// watcher then stops re-reading the ini every round.
+static std::atomic<BOOL> g_customDone{ FALSE };
 static HWND g_cachedMainWnd = NULL;
 static ULONGLONG g_cachedMainTick = 0;
 
@@ -286,7 +295,10 @@ LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam) {
         if (IsOwnWindow(pMsg->hwnd)) {
             // Discard focus-loss messages so the process keeps
             // behaving as if its window stayed in the foreground.
-            if (pMsg->message == WM_KILLFOCUS || pMsg->message == WM_ACTIVATE) {
+            // Matches the subclass in 1b: only deactivation is dropped,
+            // activation of our own window passes through.
+            if (pMsg->message == WM_KILLFOCUS ||
+                (pMsg->message == WM_ACTIVATE && LOWORD(pMsg->wParam) == WA_INACTIVE)) {
                 return 1;
             }
         }
@@ -401,8 +413,8 @@ void __fastcall FakeCustomHookB(void* thisPtr, void* EDX) {
 }
 
 static void GetDllDirectory(wchar_t* outDir, DWORD cch) {
-    wchar_t path[MAX_PATH];
-    GetModuleFileName(GetModuleHandle(L"FocusCheat.dll"), path, MAX_PATH);
+    wchar_t path[MAX_PATH] = {};
+    if (g_hSelf) GetModuleFileName(g_hSelf, path, MAX_PATH);
     std::wstring p(path);
     size_t pos = p.find_last_of(L"\\/");
     std::wstring dir = (pos == std::wstring::npos) ? L".\\" : p.substr(0, pos + 1);
@@ -457,7 +469,7 @@ static bool IsTidHooked(DWORD tid) {
 static int HookNewThreads() {
     int added = 0;
     DWORD selfPid = GetCurrentProcessId();
-    HMODULE hSelf = GetModuleHandle(L"FocusCheat.dll");
+    HMODULE hSelf = g_hSelf;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) {
         Log("thread snapshot failed err=%lu", GetLastError());
@@ -800,10 +812,12 @@ static void AttachResolvedCustom() {
 
 // One resolve+attach round. Quiet unless something happens (or verbose).
 static void TryAttachCustomOnce(bool verbose) {
+    if (g_customDone.load()) return;
     CustomConfig cfg;
     ReadCustomConfig(cfg);
     if (!cfg.hasModule) {
         if (verbose) Log("custom hooks: no Module configured, skipped");
+        g_customDone.store(TRUE);
         return;
     }
     if (verbose) Log("custom hooks: module=%S", cfg.moduleName);
@@ -816,6 +830,7 @@ static void TryAttachCustomOnce(bool verbose) {
                    (TrueCustomHookB && !g_attachedCustomB);
     if (!fresh && !pending) {
         if (verbose) Log("custom hooks: nothing new to attach");
+        g_customDone.store(TRUE);
         return;
     }
     DetourTransactionBegin();
@@ -823,6 +838,12 @@ static void TryAttachCustomOnce(bool verbose) {
     AttachResolvedCustom();
     LONG err = DetourTransactionCommit();
     Log("custom transaction commit err=%ld", err);
+    // Done once every resolved target is attached (covers partial configs
+    // where only one of A/B is configured).
+    if (!(TrueCustomHookA && !g_attachedCustomA) && !(TrueCustomHookB && !g_attachedCustomB)) {
+        g_customDone.store(TRUE);
+        Log("custom hooks: nothing left to attach, watcher stops retrying");
+    }
 }
 
 // Background watcher: performs everything too heavy for DllMain (message
@@ -847,7 +868,11 @@ static DWORD WINAPI WatchThreadProc(LPVOID) {
         TryAttachCustomOnce(true);
     }
 
-    for (int i = 0; i < 30 && g_watching.load(); i++) {
+    // Keep watching until unload: late-created threads need message hooks
+    // and modules that load minutes after injection still get their custom
+    // hooks (the round itself is a cheap thread snapshot + ini check, and
+    // stops entirely once custom hooks are done).
+    while (g_watching.load()) {
         // Sleep in small chunks so the thread notices shutdown quickly.
         for (int s = 0; s < 10 && g_watching.load(); s++) {
             Sleep(200);
@@ -900,6 +925,7 @@ void RemoveHooks() {
     }
     TrueCustomHookA = NULL;
     TrueCustomHookB = NULL;
+    g_customDone.store(FALSE);
     g_versionLoggedFor = NULL;
     g_diagDone = FALSE;
     LONG eC = DetourTransactionCommit();
@@ -913,7 +939,8 @@ void RemoveHooks() {
 // snapshot, window enumeration, ini parsing, PE scanning) happens in the
 // watcher thread outside the loader lock. Returns FALSE on API-hook failure,
 // in which case the loader unloads us and the injector reports it.
-BOOL InstallHooks() {
+BOOL InstallHooks(HMODULE hModule) {
+    g_hSelf = hModule;
     InitializeCriticalSection(&g_logCs);
     InitializeCriticalSection(&g_scanCs);
     Log("InstallHooks begin");

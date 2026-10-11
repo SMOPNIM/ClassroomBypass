@@ -84,7 +84,7 @@ msbuild Injector\Injector.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:Pl
 
 ### 也可通过 Visual Studio 编译
 
-用 VS 打开 `ClassroomBypass.slnx`，**手动选择 x86 平台后再**按 `Ctrl+Shift+B` 生成（`.slnx` 里 x64 排在前面，VS 默认选中的是 x64，必须切到 x86）。
+用 VS 打开 `ClassroomBypass.slnx`（默认平台已是 x86），按 `Ctrl+Shift+B` 生成。
 
 ---
 
@@ -141,7 +141,7 @@ Signature2=ExampleEventB
 
 如果目标函数是无帧指针的优化代码（ heuristic 找不到函数起始），可用 `FuncA_RVA` / `FuncB_RVA` + 指纹 pin 住入口：注入时先校验指纹字节、再确认函数体内前 0x400 字节引用了特征串，两项都过才挂钩，否则拒绝并记日志。
 
-注入时若配置的模块尚未加载，会启动看门线程（最多约 60 秒，每 2 秒轮询）：模块出现即补挂钩子，同时给注入后新建的线程补消息钩子。所有动作记入 DLL 同目录的 `FocusCheat.log`。
+注入时若配置的模块尚未加载，会启动看门线程（每 2 秒轮询，持续到进程退出或 DLL 卸载）：模块出现即补挂钩子，同时给注入后新建的线程补消息钩子。所有动作记入 DLL 同目录的 `FocusCheat.log`。
 
 ### 4. 如何找特征字符串
 
@@ -163,7 +163,7 @@ Signature2=ExampleEventB
 
 ## 🛠️ 常见问题
 
-### Q: 注入失败，提示 `Process not found` / `No valid target selected`
+### Q: 注入失败，提示 `Process not found` 或启动交互选择器后取消
 - 用 `Injector.exe --list` 确认目标进程名/PID 是否正确（任务管理器查看）。
 
 ### Q: 注入成功但截图依然黑屏

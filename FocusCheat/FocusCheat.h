@@ -7,5 +7,5 @@
 #define FOCUSCHEAT_API __declspec(dllimport)
 #endif
 
-FOCUSCHEAT_API BOOL InstallHooks();
+FOCUSCHEAT_API BOOL InstallHooks(HMODULE hModule);
 FOCUSCHEAT_API void RemoveHooks();
