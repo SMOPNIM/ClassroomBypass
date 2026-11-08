@@ -15,6 +15,13 @@ BOOL APIENTRY DllMain(HMODULE hModule,
         // FALSE refuses the load; the injector surfaces it via LoadLibrary NULL.
         return InstallHooks(hModule);
     case DLL_PROCESS_DETACH:
+        // lpReserved != NULL means process termination: the OS is about to
+        // tear everything down, so skip Detours/file I/O under loader lock.
+        // The module is also pinned in InstallHooks, so FreeLibrary cannot
+        // reach the full-cleanup path in normal use.
+        if (lpReserved != NULL) {
+            return TRUE;
+        }
         RemoveHooks();
         break;
     }

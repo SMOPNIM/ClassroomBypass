@@ -23,7 +23,7 @@
    - 创建远程线程调用 `LoadLibraryW`，将 DLL 加载进目标进程。
 
 2. **焦点欺骗 (`FocusCheat.dll`)**
-   - **消息过滤（两层）**：`WH_GETMESSAGE` 过滤进队列的失焦消息；主窗口再做 comctl32 子类化，丢弃直接 `SendMessage` 投递的 `WM_KILLFOCUS` / `WM_ACTIVATE(WA_INACTIVE)` / `WM_ACTIVATEAPP(FALSE)`。两层均为 best-effort，仅覆盖主窗口（子控件与 `WM_NCACTIVATE` 不动）。
+   - **消息过滤（两层）**：`WH_GETMESSAGE` 过滤进队列的失焦消息（覆盖本进程所有窗口）；主窗口再做 comctl32 子类化，丢弃直接 `SendMessage` 投递的 `WM_KILLFOCUS` / `WM_ACTIVATE(WA_INACTIVE)` / `WM_ACTIVATEAPP(FALSE)`。两层均为 best-effort（子控件与 `WM_NCACTIVATE` 不动）。
    - **API 钩子 (Detours)**：
      - `GetForegroundWindow` → 返回本进程主窗口句柄（带缓存）。
      - `SetWindowDisplayAffinity` → 对本进程窗口返回“成功”但不实际施加限制，同时注入时清除已有保护属性。
@@ -34,7 +34,8 @@
 ## 🖥️ 系统要求
 
 - Windows 10 / 11（x64 或 x86）
-- Visual Studio 2022（或 Build Tools），安装 **"使用 C++ 的桌面开发"** 工作负载
+- Visual Studio 2026（项目默认 **v145** 工具集）或 Visual Studio 2022 / Build Tools，安装 **"使用 C++ 的桌面开发"** 工作负载
+  - 使用 VS2022 时，请在项目属性中把“平台工具集”改为 **v143**（或安装 v145 工具集）；代码本身不依赖 v145 特有功能。
 - Detours 已作为 git submodule 包含在项目中，无需额外下载或设置环境变量
 
 ---
@@ -103,7 +104,7 @@ msbuild Injector\Injector.vcxproj /p:Configuration=Debug /p:Platform=Win32 /p:Pl
    ```
    完整选项见 `Injector.exe --help`（`--color`、`--quiet`、`--yes`、`--page-size`、`--verify` 等）。
    `--list` 输出是给脚本解析的纯文本（只有 PID 和进程名）；Arch / Window 两列只在交互式选择器里显示。
-   同名多进程时看 **Arch 列选 x86**（注入器是 32 位，选 64 位会被明确拒绝），再看 **Window 列**确认是主程序窗口所在的进程。注完可用 `Injector.exe --verify <PID或进程名>` 复查 DLL 是否真的在目标模块表里。
+   同名多进程时看 **Arch 列选 x86**（注入器是 32 位，选 64 位会被明确拒绝），再看 **Window 列**确认是主程序窗口所在的进程。注完可用 `Injector.exe --verify <PID或进程名> [--dll <路径>]` 按**完整路径**复查 DLL 是否真的在目标模块表里（同名但不同路径会明确提示）。
 5. 控制台输出 `DLL injected successfully and verified in target modules!` 即表示成功（附带模块表校验，不是只等线程结束）。
 6. （可选）如需启用自定义钩子，将 `FocusCheat.example.ini` 复制为 `FocusCheat.ini` 并按注释填写你自有程序的值。
 
@@ -141,7 +142,7 @@ Signature2=ExampleEventB
 
 如果目标函数是无帧指针的优化代码（ heuristic 找不到函数起始），可用 `FuncA_RVA` / `FuncB_RVA` + 指纹 pin 住入口：注入时先校验指纹字节、再确认函数体内前 0x400 字节引用了特征串，两项都过才挂钩，否则拒绝并记日志。
 
-注入时若配置的模块尚未加载，会启动看门线程（每 2 秒轮询，持续到进程退出或 DLL 卸载）：模块出现即补挂钩子，同时给注入后新建的线程补消息钩子。所有动作记入 DLL 同目录的 `FocusCheat.log`。
+注入时若配置的模块尚未加载，会启动看门线程（每 2 秒轮询，持续到进程退出）：模块出现即补挂钩子，同时给注入后新建的线程补消息钩子。所有动作记入 DLL 同目录的 `FocusCheat.log`。
 
 ### 4. 如何找特征字符串
 
@@ -154,7 +155,9 @@ Signature2=ExampleEventB
 - **杀毒软件拦截**：由于 DLL 注入技术常被恶意软件利用，Windows Defender 等会报毒。请按以下方式解决：
   - **推荐**：添加文件夹到排除项（`设置 → 安全中心 → 病毒和威胁防护 → 管理设置 → 排除项`）。
   - 或临时禁用实时保护（完成后务必重新开启）。
-- **平台匹配**：注入器与 DLL 的位数必须与目标进程一致（本仓库默认 **x86** 32 位配置）。
+- **平台匹配**：注入器与 DLL 的位数必须与目标进程一致（本仓库默认 **x86** 32 位配置；注入器不提供 x64 版本，x64 配置会在编译期直接报错）。
+- **撤回方式**：DLL 注入成功后会把自己 pin 在目标进程内，目标程序调用 `FreeLibrary` 也不会真正卸载（避免钩子/看门线程踩到已卸载代码）。要停止效果只能**重启目标进程**；注入器当前不提供卸载功能。
+- **不要多路径重复注入**：同一进程只从一个路径注入一次；不同路径的同名 DLL 会被加载成不同模块，两套钩子叠加后行为不可预测。
 - **多进程问题**：若有多个同名进程，注入器会列出并请你选择 PID。
 - **系统兼容性**：本工具仅在 Windows 10/11 上测试，其他版本未经验证。
 - **合规**：严禁用于绕过课堂/考试监控、侵犯版权或违反软件用户协议的场景。

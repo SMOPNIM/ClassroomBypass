@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <string>
+#include <vector>
 #include <atomic>
 #include <winnt.h>
 
@@ -74,21 +75,29 @@ static void Log(const char* fmt, ...) {
 }
 
 // ---------- Global variables ----------
-static HHOOK g_hMsgHooks[64];
-static int g_nMsgHooks = 0;
-static DWORD g_hookedTids[256];
-static int g_nHookedTids = 0;
-static DWORD g_failedTids[64];
-static int g_nFailedTids = 0;
+struct ThreadHook {
+    HHOOK hook;
+    DWORD tid;
+    ULONGLONG createTime; // detects TID reuse after a thread exits
+};
+struct FailedThread {
+    DWORD tid;
+    ULONGLONG createTime; // retried if the TID is later reused
+};
+static std::vector<ThreadHook> g_threadHooks;
+static std::vector<FailedThread> g_failedTids;
 static HANDLE g_hWatchThread = NULL;
 static std::atomic<BOOL> g_watching{ FALSE };
+static std::atomic<BOOL> g_apiHooksInstalled{ FALSE };
 static BOOL g_attachedCustomA = FALSE;
 static BOOL g_attachedCustomB = FALSE;
 // Set once nothing is left to attach (or nothing was configured). The
 // watcher then stops re-reading the ini every round.
 static std::atomic<BOOL> g_customDone{ FALSE };
-static HWND g_cachedMainWnd = NULL;
-static ULONGLONG g_cachedMainTick = 0;
+static std::atomic<BOOL> g_needSubclass{ FALSE };
+static std::atomic<HWND> g_cachedMainWnd{ NULL };
+static std::atomic<ULONGLONG> g_cachedMainTick{ 0 };
+static BOOL g_csInitialized = FALSE;
 
 // Original API pointers (for restoration)
 HWND(WINAPI* TrueGetForegroundWindow)(void) = GetForegroundWindow;
@@ -176,6 +185,9 @@ static DWORD FindWideStringInRdataFrom(const char* keyword, DWORD start) {
 }
 
 static DWORD FindFuncStart(DWORD textOffset) {
+    // Check the size before clamping: g_dwTextSize - 3 would underflow.
+    if (!g_pTextBase || g_dwTextSize < 3) return 0;
+    if (textOffset > g_dwTextSize - 3) textOffset = g_dwTextSize - 3;
     DWORD searchStart = (textOffset > 0x1000) ? textOffset - 0x1000 : 0;
     for (DWORD i = textOffset; i > searchStart; i--) {
         if (g_pTextBase[i] == 0x55 && g_pTextBase[i + 1] == 0x8B && g_pTextBase[i + 2] == 0xEC) {
@@ -268,16 +280,25 @@ static HWND GetOwnMainWindow() {
 // path like GetForegroundWindow. Re-enumerate at most every 5 seconds or
 // when the cached handle dies. Benign races (double enumeration) are fine.
 static HWND GetCachedMainWindow() {
-    if (g_cachedMainWnd && IsWindow(g_cachedMainWnd)) {
+    HWND cached = g_cachedMainWnd.load();
+    if (cached && IsWindow(cached)) {
         DWORD pid = 0;
-        GetWindowThreadProcessId(g_cachedMainWnd, &pid);
-        if (pid == GetCurrentProcessId()) return g_cachedMainWnd;
+        GetWindowThreadProcessId(cached, &pid);
+        if (pid == GetCurrentProcessId()) return cached;
+        g_cachedMainWnd.store(NULL);
     }
     ULONGLONG now = GetTickCount64();
-    if (g_cachedMainWnd && now - g_cachedMainTick < 5000) return g_cachedMainWnd;
-    g_cachedMainWnd = GetOwnMainWindow();
-    g_cachedMainTick = now;
-    return g_cachedMainWnd;
+    ULONGLONG last = g_cachedMainTick.load();
+    if (last && now - last < 5000) {
+        // A concurrent UpdateSubclass may have published a window after the
+        // first load above; re-check before reporting "no window".
+        cached = g_cachedMainWnd.load();
+        return (cached && IsWindow(cached)) ? cached : NULL;
+    }
+    HWND found = GetOwnMainWindow();
+    g_cachedMainWnd.store(found);
+    g_cachedMainTick.store(now);
+    return found;
 }
 
 // ---------- 1. Message hook: intercept focus-loss messages ----------
@@ -287,12 +308,16 @@ static void UpdateSubclass(); // see 1b below
 // subclass below (section 1b) covers that path. Together the two layers
 // are best-effort but cover both delivery mechanisms for the main window.
 LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam) {
-    // Runs on the pumping thread's context, i.e. the window's own UI
-    // thread - the correct place to (re)subclass. Cheap: throttled inside.
-    UpdateSubclass();
+    // Runs on any thread that pumps messages, not necessarily the window's
+    // UI thread. Keep this path cheap: enumeration/subclassing is done by
+    // the watcher thread.
+    if (code < 0) {
+        return CallNextHookEx(NULL, code, wParam, lParam);
+    }
     if (code == HC_ACTION) {
         MSG* pMsg = (MSG*)lParam;
         if (IsOwnWindow(pMsg->hwnd)) {
+            g_needSubclass.store(TRUE);
             // Discard focus-loss messages so the process keeps
             // behaving as if its window stayed in the foreground.
             // Matches the subclass in 1b: only deactivation is dropped,
@@ -317,7 +342,7 @@ LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam) {
 // disagrees, risking visual tearing; app pause logic keys off
 // KILLFOCUS/ACTIVATE/ACTIVATEAPP, which we do drop.
 static std::atomic<HWND> g_subclassedWnd{ NULL };
-static ULONGLONG g_lastSubclassTryTick = 0;
+static std::atomic<ULONGLONG> g_lastSubclassTryTick{ 0 };
 
 static LRESULT CALLBACK FocusLossSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
                                               LPARAM lParam, UINT_PTR uId,
@@ -335,15 +360,14 @@ static LRESULT CALLBACK FocusLossSubclassProc(HWND hwnd, UINT msg, WPARAM wParam
 }
 
 // (Re)subclass the current main window. Idempotent, throttled to 1s.
-// Called from GetMsgProc (runs on the window's own thread - preferred)
-// and from the watcher as a fallback when the UI thread is not pumping
-// yet. Cross-thread SetWindowSubclass is best-effort: it is an atomic
-// WNDPROC swap; the worst case is one racing dispatch, and the window
-// only outlives the swap in ways the app already tolerates.
+// Called from the watcher only, outside the loader lock. Cross-thread
+// SetWindowSubclass is best-effort: it is an atomic WNDPROC swap; the
+// worst case is one racing dispatch.
 static void UpdateSubclass() {
     ULONGLONG now = GetTickCount64();
-    if (g_lastSubclassTryTick && now - g_lastSubclassTryTick < 1000) return;
-    g_lastSubclassTryTick = now;
+    ULONGLONG last = g_lastSubclassTryTick.load();
+    if (last && now - last < 1000) return;
+    g_lastSubclassTryTick.store(now);
 
     HWND prev = g_subclassedWnd.load();
     if (prev && !IsWindow(prev)) {
@@ -351,7 +375,10 @@ static void UpdateSubclass() {
         prev = NULL;
     }
     HWND h = GetOwnMainWindow();
-    if (!h || h == prev) return;
+    if (!h) return;
+    g_cachedMainWnd.store(h);
+    g_cachedMainTick.store(now);
+    if (h == prev) return;
 
     if (SetWindowSubclass(h, FocusLossSubclassProc, 1, 0)) {
         HWND old = g_subclassedWnd.exchange(h);
@@ -457,9 +484,21 @@ static void ReadCustomConfig(CustomConfig& cfg) {
     cfg.hasModule = (cfg.moduleName[0] != 0);
 }
 
+static ULONGLONG GetThreadCreateTime(DWORD tid) {
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (!h) return 0;
+    FILETIME c, e, k, u;
+    ULONGLONG result = 0;
+    if (GetThreadTimes(h, &c, &e, &k, &u)) {
+        result = ((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime;
+    }
+    CloseHandle(h);
+    return result;
+}
+
 static bool IsTidHooked(DWORD tid) {
-    for (int i = 0; i < g_nHookedTids; i++) {
-        if (g_hookedTids[i] == tid) return true;
+    for (const auto& th : g_threadHooks) {
+        if (th.tid == tid) return true;
     }
     return false;
 }
@@ -467,9 +506,41 @@ static bool IsTidHooked(DWORD tid) {
 // Hooks message handling on all not-yet-hooked threads of this process.
 // Returns the number of newly hooked threads.
 static int HookNewThreads() {
+    // Drop records for threads that exited or whose TID was reused.
+    for (size_t i = 0; i < g_threadHooks.size();) {
+        ThreadHook& th = g_threadHooks[i];
+        ULONGLONG ct = GetThreadCreateTime(th.tid);
+        if (ct == 0) {
+            if (th.hook) UnhookWindowsHookEx(th.hook);
+            g_threadHooks.erase(g_threadHooks.begin() + i);
+        }
+        else if (th.createTime == 0) {
+            th.createTime = ct;
+            ++i;
+        }
+        else if (th.createTime != ct) {
+            if (th.hook) UnhookWindowsHookEx(th.hook);
+            g_threadHooks.erase(g_threadHooks.begin() + i);
+        }
+        else {
+            ++i;
+        }
+    }
+
+    // Drop records for failed threads that exited or whose TID was reused,
+    // so a new thread inheriting the TID is retried instead of skipped.
+    for (size_t i = 0; i < g_failedTids.size();) {
+        ULONGLONG ct = GetThreadCreateTime(g_failedTids[i].tid);
+        if (ct == 0 || g_failedTids[i].createTime != ct) {
+            g_failedTids.erase(g_failedTids.begin() + i);
+        }
+        else {
+            ++i;
+        }
+    }
+
     int added = 0;
     DWORD selfPid = GetCurrentProcessId();
-    HMODULE hSelf = g_hSelf;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) {
         Log("thread snapshot failed err=%lu", GetLastError());
@@ -477,38 +548,33 @@ static int HookNewThreads() {
     }
     THREADENTRY32 te;
     te.dwSize = sizeof(te);
-    bool exhaustedLogged = false;
     if (Thread32First(snap, &te)) {
         do {
             if (te.th32OwnerProcessID != selfPid) continue;
             if (IsTidHooked(te.th32ThreadID)) continue;
-            if (g_nMsgHooks >= 64 || g_nHookedTids >= 256) {
-                // Slots full: skip this thread but keep enumerating the rest.
-                if (!exhaustedLogged) {
-                    Log("message hook slots exhausted, skipping rest of this pass");
-                    exhaustedLogged = true;
-                }
-                continue;
-            }
-            HHOOK h = SetWindowsHookEx(WH_GETMESSAGE, GetMsgProc, hSelf, te.th32ThreadID);
+            HHOOK h = SetWindowsHookEx(WH_GETMESSAGE, GetMsgProc, g_hSelf, te.th32ThreadID);
             if (h) {
-                g_hMsgHooks[g_nMsgHooks++] = h;
-                g_hookedTids[g_nHookedTids++] = te.th32ThreadID;
+                ULONGLONG ct = GetThreadCreateTime(te.th32ThreadID);
+                g_threadHooks.push_back({ h, te.th32ThreadID, ct });
                 added++;
             }
             else {
-                // Log each failing tid only once (ring: oldest entries are
-                // overwritten once full, so a repeat may re-log rarely).
+                DWORD failErr = GetLastError();
+                ULONGLONG ct = GetThreadCreateTime(te.th32ThreadID);
+                if (ct == 0) continue; // thread vanished during the snapshot
                 bool logged = false;
-                int known = g_nFailedTids < 64 ? g_nFailedTids : 64;
-                for (int k = 0; k < known; k++) {
-                    if (g_failedTids[k] == te.th32ThreadID) { logged = true; break; }
+                for (const auto& ft : g_failedTids) {
+                    if (ft.tid == te.th32ThreadID && ft.createTime == ct) {
+                        logged = true;
+                        break;
+                    }
                 }
                 if (!logged) {
                     Log("SetWindowsHookEx tid %lu failed err=%lu (best effort, skipped)",
-                        (unsigned long)te.th32ThreadID, GetLastError());
-                    g_failedTids[g_nFailedTids % 64] = te.th32ThreadID;
-                    g_nFailedTids++;
+                        (unsigned long)te.th32ThreadID, failErr);
+                    if (g_failedTids.size() < 1024) {
+                        g_failedTids.push_back({ te.th32ThreadID, ct });
+                    }
                 }
             }
         } while (Thread32Next(snap, &te));
@@ -668,10 +734,6 @@ static bool TryResolvePinned(HMODULE hMod, const wchar_t* rvaStr, const char* fp
         return false;
     }
     BYTE* base = (BYTE*)hMod;
-    if (!InitPESections(hMod)) {
-        Log("custom %c: PE parse failed", label);
-        return false;
-    }
     DWORD textRva = (DWORD)(g_pTextBase - base);
     if (rva < textRva || rva + (DWORD)fpLen > textRva + g_dwTextSize) {
         Log("custom %c: RVA 0x%X outside .text, refused", label, rva);
@@ -694,7 +756,7 @@ static bool TryResolvePinned(HMODULE hMod, const wchar_t* rvaStr, const char* fp
     // Consistency check: the marker string (narrow or wide) must be
     // referenced within the first 0x400 bytes (matches the analyzed layout).
     // The scan is bounded to the section end. Refuse otherwise.
-    if (sig[0] && InitPESections(hMod)) {
+    if (sig[0]) {
         DWORD textRva2 = (DWORD)(g_pTextBase - base);
         DWORD scanLen = 0x400;
         if (rva >= textRva2 && rva - textRva2 < g_dwTextSize) {
@@ -795,18 +857,19 @@ static bool ResolveCustomTargets(const CustomConfig& cfg) {
 }
 
 // Attaches resolved-but-unattached custom hooks. Caller must hold an
-// active Detours transaction.
-static void AttachResolvedCustom() {
+// active Detours transaction. The attached flags are updated only after
+// a successful commit (see TryAttachCustomOnce).
+static void AttachResolvedCustom(LONG& errA, LONG& errB) {
     ScanLock scanLock;
+    errA = NO_ERROR;
+    errB = NO_ERROR;
     if (TrueCustomHookA && !g_attachedCustomA) {
-        LONG err = DetourAttach(&(PVOID&)TrueCustomHookA, FakeCustomHookA);
-        Log("attach custom A err=%ld", err);
-        if (err == NO_ERROR) g_attachedCustomA = TRUE;
+        errA = DetourAttach(&(PVOID&)TrueCustomHookA, FakeCustomHookA);
+        Log("attach custom A err=%ld", errA);
     }
     if (TrueCustomHookB && !g_attachedCustomB) {
-        LONG err = DetourAttach(&(PVOID&)TrueCustomHookB, FakeCustomHookB);
-        Log("attach custom B err=%ld", err);
-        if (err == NO_ERROR) g_attachedCustomB = TRUE;
+        errB = DetourAttach(&(PVOID&)TrueCustomHookB, FakeCustomHookB);
+        Log("attach custom B err=%ld", errB);
     }
 }
 
@@ -833,11 +896,24 @@ static void TryAttachCustomOnce(bool verbose) {
         g_customDone.store(TRUE);
         return;
     }
-    DetourTransactionBegin();
+    LONG begin = DetourTransactionBegin();
+    if (begin != NO_ERROR) {
+        Log("custom transaction begin err=%ld", begin);
+        return;
+    }
     DetourUpdateThread(GetCurrentThread());
-    AttachResolvedCustom();
+    LONG errA = NO_ERROR, errB = NO_ERROR;
+    AttachResolvedCustom(errA, errB);
     LONG err = DetourTransactionCommit();
-    Log("custom transaction commit err=%ld", err);
+    Log("custom transaction A=%ld B=%ld commit=%ld", errA, errB, err);
+    if (err == NO_ERROR) {
+        if (errA == NO_ERROR && TrueCustomHookA && !g_attachedCustomA) {
+            g_attachedCustomA = TRUE;
+        }
+        if (errB == NO_ERROR && TrueCustomHookB && !g_attachedCustomB) {
+            g_attachedCustomB = TRUE;
+        }
+    }
     // Done once every resolved target is attached (covers partial configs
     // where only one of A/B is configured).
     if (!(TrueCustomHookA && !g_attachedCustomA) && !(TrueCustomHookB && !g_attachedCustomB)) {
@@ -851,6 +927,10 @@ static void TryAttachCustomOnce(bool verbose) {
 // lock), then keeps watching for late module loads and late-created threads.
 static DWORD WINAPI WatchThreadProc(LPVOID) {
     Log("watcher start");
+    if (!g_watching.load()) {
+        Log("watcher start aborted (shutdown requested)");
+        return 0;
+    }
 
     // First pass runs immediately: message hooks, affinity clear, custom hooks.
     {
@@ -868,14 +948,21 @@ static DWORD WINAPI WatchThreadProc(LPVOID) {
         TryAttachCustomOnce(true);
     }
 
-    // Keep watching until unload: late-created threads need message hooks
+    // Keep watching until shutdown (in practice: process exit; the module is
+    // pinned): late-created threads need message hooks
     // and modules that load minutes after injection still get their custom
     // hooks (the round itself is a cheap thread snapshot + ini check, and
     // stops entirely once custom hooks are done).
     while (g_watching.load()) {
         // Sleep in small chunks so the thread notices shutdown quickly.
+        // GetMsgProc only sets a flag; the potentially expensive enumeration
+        // happens here, off the target's message-pump threads.
         for (int s = 0; s < 10 && g_watching.load(); s++) {
             Sleep(200);
+            if (!g_watching.load()) break;
+            if (g_needSubclass.exchange(FALSE)) {
+                UpdateSubclass();
+            }
         }
         if (!g_watching.load()) break;
         int added = HookNewThreads();
@@ -891,46 +978,79 @@ static DWORD WINAPI WatchThreadProc(LPVOID) {
 
 // ---------- Uninstall all hooks ----------
 void RemoveHooks() {
+    if (!g_apiHooksInstalled.exchange(FALSE)) return;
     Log("RemoveHooks begin");
     g_watching.store(FALSE);
-    // NOTE: deliberately no WaitForSingleObject/CloseHandle here. Waiting
-    // inside DllMain risks deadlock, and closing the handle while the thread
-    // might still run risks use-after-unmap. The thread exits itself within
-    // ~200ms (chunked sleep); the leaked handle dies with the process.
 
-    for (int i = 0; i < g_nMsgHooks; i++) {
-        if (g_hMsgHooks[i]) {
-            UnhookWindowsHookEx(g_hMsgHooks[i]);
-            g_hMsgHooks[i] = NULL;
+    // Stop the watcher before touching shared hook/Detours state. In normal
+    // use DllMain only reaches RemoveHooks on FreeLibrary, and pinning makes
+    // FreeLibrary a no-op that never sends DLL_PROCESS_DETACH, so this wait
+    // is a defensive path rather than the normal shutdown route. If pinning
+    // is ever removed, re-evaluate the loader-lock deadlock risk here: the
+    // watcher may be inside a Detours transaction that needs the loader lock.
+    if (g_hWatchThread) {
+        // 5s is generous for the watcher's normal 200ms cycle. If it still
+        // times out, abort instead of proceeding: the watcher may be inside
+        // TryAttachCustomOnce's Detours transaction, and Detours allows only
+        // one transaction at a time. g_apiHooksInstalled is restored so a
+        // later RemoveHooks call can retry once the watcher has exited.
+        DWORD wr = WaitForSingleObject(g_hWatchThread, 5000);
+        if (wr != WAIT_OBJECT_0) {
+            Log("RemoveHooks: watcher did not stop (wait=%lu), cleanup aborted", wr);
+            g_apiHooksInstalled.store(TRUE);
+            return;
         }
+        CloseHandle(g_hWatchThread);
+        g_hWatchThread = NULL;
     }
-    g_nMsgHooks = 0;
-    g_nHookedTids = 0;
-    g_nFailedTids = 0;
+
+    for (const auto& th : g_threadHooks) {
+        if (th.hook) UnhookWindowsHookEx(th.hook);
+    }
+    g_threadHooks.clear();
+    g_failedTids.clear();
 
     RemoveSubclass();
 
-    DetourTransactionBegin();
+    LONG begin = DetourTransactionBegin();
+    if (begin != NO_ERROR) {
+        Log("detach transaction begin err=%ld", begin);
+        g_apiHooksInstalled.store(TRUE);
+        return;
+    }
     DetourUpdateThread(GetCurrentThread());
     LONG eFg = DetourDetach(&(PVOID&)TrueGetForegroundWindow, FakeGetForegroundWindow);
     LONG eAf = DetourDetach(&(PVOID&)TrueSetWindowDisplayAffinity, FakeSetWindowDisplayAffinity);
     LONG eA = NO_ERROR, eB = NO_ERROR;
-    if (g_attachedCustomA) {
-        eA = DetourDetach(&(PVOID&)TrueCustomHookA, FakeCustomHookA);
-        g_attachedCustomA = FALSE;
+    {
+        ScanLock scanLock;
+        if (g_attachedCustomA) {
+            eA = DetourDetach(&(PVOID&)TrueCustomHookA, FakeCustomHookA);
+        }
+        if (g_attachedCustomB) {
+            eB = DetourDetach(&(PVOID&)TrueCustomHookB, FakeCustomHookB);
+        }
     }
-    if (g_attachedCustomB) {
-        eB = DetourDetach(&(PVOID&)TrueCustomHookB, FakeCustomHookB);
-        g_attachedCustomB = FALSE;
-    }
-    TrueCustomHookA = NULL;
-    TrueCustomHookB = NULL;
-    g_customDone.store(FALSE);
-    g_versionLoggedFor = NULL;
-    g_diagDone = FALSE;
     LONG eC = DetourTransactionCommit();
     Log("detach fg=%ld affinity=%ld customA=%ld customB=%ld commit=%ld",
         eFg, eAf, eA, eB, eC);
+    if (eC == NO_ERROR) {
+        g_attachedCustomA = FALSE;
+        g_attachedCustomB = FALSE;
+        TrueCustomHookA = NULL;
+        TrueCustomHookB = NULL;
+        g_customDone.store(FALSE);
+        g_versionLoggedFor = NULL;
+        g_diagDone = FALSE;
+    }
+    else {
+        g_apiHooksInstalled.store(TRUE); // let a later call retry
+    }
+
+    g_cachedMainWnd.store(NULL);
+    g_cachedMainTick.store(0);
+    g_lastSubclassTryTick.store(0);
+    g_needSubclass.store(FALSE);
 }
 
 // ---------- Install all hooks ----------
@@ -941,11 +1061,30 @@ void RemoveHooks() {
 // in which case the loader unloads us and the injector reports it.
 BOOL InstallHooks(HMODULE hModule) {
     g_hSelf = hModule;
-    InitializeCriticalSection(&g_logCs);
-    InitializeCriticalSection(&g_scanCs);
+    if (!g_csInitialized) {
+        InitializeCriticalSection(&g_logCs);
+        InitializeCriticalSection(&g_scanCs);
+        g_csInitialized = TRUE;
+    }
     Log("InstallHooks begin");
+    if (g_apiHooksInstalled.load()) {
+        Log("InstallHooks: already installed, ignoring");
+        return TRUE;
+    }
 
-    DetourTransactionBegin();
+    LONG begin = DetourTransactionBegin();
+    if (begin != NO_ERROR) {
+        Log("InstallHooks: transaction begin failed err=%ld", begin);
+        return FALSE;
+    }
+    // NOTE: DetourUpdateThread(GetCurrentThread()) is a no-op in Detours.
+    // We deliberately avoid enumerating/suspending every target thread while
+    // holding the loader lock: a suspended thread may own the heap lock and
+    // Detours allocates during the transaction. The patch window is therefore
+    // not fully quiesced; keep the API patch set small and do it at inject time.
+    // Future direction: move DetourAttach into the watcher thread (outside the
+    // loader lock), then enumerate and DetourUpdateThread every target thread
+    // before commit to close the attach race.
     DetourUpdateThread(GetCurrentThread());
     LONG errFg = DetourAttach(&(PVOID&)TrueGetForegroundWindow, FakeGetForegroundWindow);
     LONG errAf = DetourAttach(&(PVOID&)TrueSetWindowDisplayAffinity, FakeSetWindowDisplayAffinity);
@@ -956,6 +1095,34 @@ BOOL InstallHooks(HMODULE hModule) {
         Log("InstallHooks: API hook install FAILED, refusing load");
         return FALSE;
     }
+    g_apiHooksInstalled.store(TRUE);
+
+    // Pin this module. A target-side FreeLibrary must not unmap the DLL
+    // while hook procedures or the watcher thread may still be executing
+    // code inside it. Removal therefore requires restarting the target.
+    HMODULE hPinned = NULL;
+    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           (LPCTSTR)&InstallHooks, &hPinned)) {
+        DWORD pinErr = GetLastError();
+        Log("InstallHooks: pin failed err=%lu, refusing load", pinErr);
+        if (DetourTransactionBegin() == NO_ERROR) {
+            DetourUpdateThread(GetCurrentThread());
+            DetourDetach(&(PVOID&)TrueGetForegroundWindow, FakeGetForegroundWindow);
+            DetourDetach(&(PVOID&)TrueSetWindowDisplayAffinity, FakeSetWindowDisplayAffinity);
+            DetourTransactionCommit();
+        }
+        g_apiHooksInstalled.store(FALSE);
+        return FALSE;
+    }
+
+    g_customDone.store(FALSE);
+    g_versionLoggedFor = NULL;
+    g_diagDone = FALSE;
+    g_cachedMainWnd.store(NULL);
+    g_cachedMainTick.store(0);
+    g_lastSubclassTryTick.store(0);
+    g_needSubclass.store(FALSE);
 
     g_watching.store(TRUE);
     g_hWatchThread = CreateThread(NULL, 0, WatchThreadProc, NULL, 0, NULL);

@@ -6,7 +6,12 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <atomic>
 #include <cwctype>
+
+#if defined(_WIN64)
+#error This injector only supports 32-bit (Win32) builds.
+#endif
 
 // Generic DLL injector.
 // No hardcoded target process: the target is chosen via command-line
@@ -328,6 +333,14 @@ static Arch MachineToArch(USHORT machine) {
     }
 }
 
+static bool Is64BitWindows() {
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    return si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ||
+           si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64 ||
+           si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_IA64;
+}
+
 // Preferred: IsWow64Process2 distinguishes x64/ARM64; falls back to
 // IsWow64Process on older systems.
 static Arch GetProcessArch(HANDLE hProcess) {
@@ -350,7 +363,9 @@ static Arch GetProcessArch(HANDLE hProcess) {
     if (!fn) return Arch::Unknown;
     BOOL wow = FALSE;
     if (!fn(hProcess, &wow)) return Arch::Unknown;
-    return wow ? Arch::X86 : Arch::X64;
+    if (wow) return Arch::X86;
+    // A native process on 32-bit Windows is x86, not x64.
+    return Is64BitWindows() ? Arch::X64 : Arch::X86;
 }
 
 static std::wstring ArchName(Arch arch) {
@@ -494,8 +509,29 @@ static std::wstring DllFileName(const std::wstring& dllPath) {
     return base;
 }
 
-// Checks whether a module file name is loaded in the target process.
-static bool ModulePresentInProcess(DWORD pid, const std::wstring& moduleFile) {
+// Resolve a possibly-relative path to an absolute path. Used both before
+// injection (so the target does not resolve against its own CWD) and by
+// --verify (so module comparison is path-accurate).
+static std::wstring FullPathOf(const std::wstring& path) {
+    DWORD need = GetFullPathNameW(path.c_str(), 0, NULL, NULL);
+    if (need == 0) return path;
+    std::wstring full(need, L'\0');
+    DWORD n = GetFullPathNameW(path.c_str(), need, full.data(), NULL);
+    if (n == 0 || n >= need) return path;
+    full.resize(n);
+    return full;
+}
+
+// Checks whether the DLL at dllPath is loaded in the target process.
+// Compares full paths, not just file names, so a same-named DLL loaded from
+// another directory is not mistaken for the requested one. If actualPath is
+// non-null it receives the matching loaded path, or the first same-named
+// module from a different path when no exact match exists.
+static bool ModulePresentInProcess(DWORD pid, const std::wstring& dllPath,
+                                   std::wstring* actualPath = NULL) {
+    std::wstring wanted = FullPathOf(dllPath);
+    std::wstring wantedName = DllFileName(wanted);
+    std::wstring sameNamePath;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (snap == INVALID_HANDLE_VALUE) return false;
     MODULEENTRY32 me;
@@ -503,23 +539,29 @@ static bool ModulePresentInProcess(DWORD pid, const std::wstring& moduleFile) {
     bool found = false;
     if (Module32First(snap, &me)) {
         do {
-            if (_wcsicmp(me.szModule, moduleFile.c_str()) == 0) {
+            if (_wcsicmp(me.szExePath, wanted.c_str()) == 0) {
+                if (actualPath) *actualPath = me.szExePath;
                 found = true;
                 break;
+            }
+            if (sameNamePath.empty() &&
+                _wcsicmp(me.szModule, wantedName.c_str()) == 0) {
+                sameNamePath = me.szExePath;
             }
         } while (Module32Next(snap, &me));
     }
     CloseHandle(snap);
+    if (!found && actualPath) *actualPath = sameNamePath;
     return found;
 }
 
 // Set while the picker runs; lets Ctrl+C cancel instead of killing.
 // (Ctrl+Break keeps its default terminate behavior.)
-static volatile BOOL g_pickerCancel = FALSE;
+static std::atomic<BOOL> g_pickerCancel{ FALSE };
 
 static BOOL WINAPI PickerCtrlHandler(DWORD ctrlType) {
     if (ctrlType == CTRL_C_EVENT) {
-        g_pickerCancel = TRUE;
+        g_pickerCancel.store(TRUE);
         return TRUE;
     }
     return FALSE;
@@ -757,7 +799,7 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
     // (Ctrl+Break keeps its default terminate behavior.)
     struct CtrlGuard {
         CtrlGuard() {
-            g_pickerCancel = FALSE;
+            g_pickerCancel.store(FALSE);
             SetConsoleCtrlHandler(PickerCtrlHandler, TRUE);
         }
         ~CtrlGuard() { SetConsoleCtrlHandler(PickerCtrlHandler, FALSE); }
@@ -853,7 +895,7 @@ DWORD Run(const std::vector<ProcessEntry>& rows, const std::wstring& initialFilt
     paintOnce();
     ULONGLONG lastPaint = GetTickCount64();
     for (;;) {
-        if (g_pickerCancel) { finalPid = 0; break; } // Ctrl+C requested cancel
+        if (g_pickerCancel.load()) { finalPid = 0; break; } // Ctrl+C requested cancel
         if (needRender || paintPending) {
             // Coalesce bursts: while input is queued and we painted recently,
             // skip this frame; it will be painted once the queue drains.
@@ -997,14 +1039,22 @@ static DWORD ResolveNameToPid(const std::wstring& name, const Options& opt) {
     return picker::Run(cands, L"", opt.pageSize);
 }
 
-// Interactive fallback: pick from the full process list.
-static DWORD PromptForTarget(const Options& opt) {
+// Interactive fallback: pick from the full process list. Returns the
+// selected row so the caller does not need to enumerate processes again.
+static ProcessEntry PromptForTarget(const Options& opt) {
     std::vector<ProcessEntry> procs = ListAllProcesses();
     if (procs.empty()) {
         ui::Error(L"Unable to enumerate processes.");
-        return 0;
+        return ProcessEntry{};
     }
-    return picker::Run(procs, L"", opt.pageSize);
+    DWORD pid = picker::Run(procs, L"", opt.pageSize);
+    if (pid == 0) return ProcessEntry{};
+    for (const auto& e : procs) {
+        if (e.pid == pid) return e;
+    }
+    ProcessEntry fallback;
+    fallback.pid = pid; // row vanished between pick and return
+    return fallback;
 }
 
 static bool ParseColorValue(const std::wstring& v, Options& opt) {
@@ -1161,8 +1211,7 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     if (!opt.verifyTarget.empty()) {
-        std::wstring dllPath = opt.dllPath.empty() ? GetDefaultDllPath() : opt.dllPath;
-        std::wstring dllFile = DllFileName(dllPath);
+        std::wstring dllPath = FullPathOf(opt.dllPath.empty() ? GetDefaultDllPath() : opt.dllPath);
         std::vector<DWORD> targets;
         if (IsAllDigits(opt.verifyTarget)) {
             targets.push_back(static_cast<DWORD>(std::wcstoul(opt.verifyTarget.c_str(), nullptr, 10)));
@@ -1177,15 +1226,17 @@ int wmain(int argc, wchar_t** argv) {
         }
         bool anyFound = false;
         for (DWORD vpid : targets) {
-            wchar_t buf[192];
-            if (ModulePresentInProcess(vpid, dllFile)) {
-                swprintf_s(buf, L"PID %lu: %s is loaded.", (unsigned long)vpid, dllFile.c_str());
-                ui::Success(buf);
+            std::wstring loadedPath;
+            if (ModulePresentInProcess(vpid, dllPath, &loadedPath)) {
+                ui::Success(L"PID " + std::to_wstring(vpid) + L": " + dllPath + L" is loaded.");
                 anyFound = true;
             }
             else {
-                swprintf_s(buf, L"PID %lu: %s is NOT loaded.", (unsigned long)vpid, dllFile.c_str());
-                ui::Warn(buf);
+                ui::Warn(L"PID " + std::to_wstring(vpid) + L": " + dllPath + L" is NOT loaded.");
+                if (!loadedPath.empty()) {
+                    ui::Info(L"  Note: a same-named module is loaded from " + loadedPath +
+                             L" (different path).");
+                }
                 HANDLE hv = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, vpid);
                 if (hv) {
                     Arch va = GetProcessArch(hv);
@@ -1224,22 +1275,26 @@ int wmain(int argc, wchar_t** argv) {
         if (!interactive) {
             return Fail(opt, L"No target given. Use --pid, --process, or run in a console for the picker.");
         }
-        pid = PromptForTarget(opt);
-        if (pid == 0) {
+        ProcessEntry chosen = PromptForTarget(opt);
+        if (chosen.pid == 0) {
             // Picker/FallbackPick already reported why (cancel or error).
             WaitForExitKey(opt);
             return 1;
         }
+        pid = chosen.pid;
         if (!ProcessExists(pid)) {
             return Fail(opt, L"Process not found (PID " + std::to_wstring(pid) + L").");
         }
-        std::vector<ProcessEntry> all = ListAllProcesses();
-        targetDesc = ProcessNameByPid(all, pid) + L" (PID " + std::to_wstring(pid) + L")";
+        targetDesc = chosen.name.empty()
+            ? L"PID " + std::to_wstring(pid)
+            : chosen.name + L" (PID " + std::to_wstring(pid) + L")";
     }
     ui::Success(L"Target: " + targetDesc);
 
-    // DLL path (explicit --dll or auto-located next to Injector.exe)
-    std::wstring dllPath = opt.dllPath.empty() ? GetDefaultDllPath() : opt.dllPath;
+    // DLL path (explicit --dll or auto-located next to Injector.exe).
+    // Normalize before injection so the target does not resolve a relative
+    // path against its own working directory.
+    std::wstring dllPath = FullPathOf(opt.dllPath.empty() ? GetDefaultDllPath() : opt.dllPath);
     if (GetFileAttributes(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         return Fail(opt, L"DLL not found: " + dllPath);
     }
@@ -1343,17 +1398,22 @@ int wmain(int argc, wchar_t** argv) {
     VirtualFreeEx(hProcess, pRemoteMem, 0, MEM_RELEASE);
 
     // Verify truthfully: the thread exit code is the HMODULE returned by
-    // LoadLibraryW, and the module must show up in the target's module list.
-    std::wstring dllFile = DllFileName(dllPath);
+    // LoadLibraryW, and the module must show up in the target's module list
+    // at the exact path we injected (not just a same-named DLL).
     if (threadExit == 0) {
         CloseHandle(hProcess);
         return Fail(opt, L"LoadLibraryW returned NULL in the target process. "
                          L"The DLL failed to load (often a 32/64-bit mismatch or a missing dependency).");
     }
-    if (!ModulePresentInProcess(pid, dllFile)) {
+    std::wstring loadedPath;
+    if (!ModulePresentInProcess(pid, dllPath, &loadedPath)) {
         CloseHandle(hProcess);
-        return Fail(opt, L"Remote thread finished but " + dllFile +
-                         L" was not found in the target's modules. Injection did not take effect.");
+        std::wstring msg = L"Remote thread finished but " + dllPath +
+                           L" was not found in the target's modules. Injection did not take effect.";
+        if (!loadedPath.empty()) {
+            msg += L" A same-named module is loaded from " + loadedPath + L".";
+        }
+        return Fail(opt, msg);
     }
     CloseHandle(hProcess);
 
